@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+*.jsonl
+.env
+.env.*
+.gstack/
+.agents/
+.DS_Store

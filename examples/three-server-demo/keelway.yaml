@@ -1,0 +1,59 @@
+bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/default.cedar"
+
+principals:
+  - org_id: "acme"
+    agent_id: "coding-agent"
+    roles: ["developer"]
+    token_ref: "dev-coding-token"
+  - org_id: "acme"
+    agent_id: "research-agent"
+    roles: ["researcher"]
+    token_ref: "dev-research-token"
+
+servers:
+  - alias: "github"
+    timeout_ms: 30000
+    tools: ["read_repository", "create_pull_request", "delete_repository"]
+    transport:
+      type: "streamable_http"
+      url: "http://127.0.0.1:9001/mcp"
+      headers: {}
+  - alias: "database"
+    timeout_ms: 30000
+    tools: ["query_readonly"]
+    transport:
+      type: "streamable_http"
+      url: "http://127.0.0.1:9002/mcp"
+      headers: {}
+  - alias: "filesystem"
+    timeout_ms: 30000
+    tools: ["read_file"]
+    transport:
+      type: "streamable_http"
+      url: "http://127.0.0.1:9003/mcp"
+      headers: {}
+
+validators:
+  - id: "allowed_repo"
+    server: "github"
+    tool: "read_repository"
+    arg_name: "repo"
+    kind:
+      type: "repo_allowlist"
+      repos: ["sorvex/keelway"]
+  - id: "readonly_sql"
+    server: "database"
+    tool: "query_readonly"
+    arg_name: "sql"
+    kind:
+      type: "sql_readonly"
+  - id: "workspace_path"
+    server: "filesystem"
+    tool: "read_file"
+    arg_name: "path"
+    kind:
+      type: "path_within"
+      root: "/workspace"

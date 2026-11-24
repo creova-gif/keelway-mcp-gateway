@@ -1,0 +1,31 @@
+- name: "coding-agent reads authorized repo"
+  org_id: "acme"
+  agent_id: "coding-agent"
+  server: "github"
+  tool: "read_repository"
+  arguments: { repo: "sorvex/keelway" }
+  expected: ALLOW
+
+- name: "coding-agent blocked from deleting repo"
+  org_id: "acme"
+  agent_id: "coding-agent"
+  server: "github"
+  tool: "delete_repository"
+  arguments: { repo: "sorvex/keelway" }
+  expected: DENY
+
+- name: "research-agent runs readonly SQL"
+  org_id: "acme"
+  agent_id: "research-agent"
+  server: "database"
+  tool: "query_readonly"
+  arguments: { sql: "SELECT id, name FROM docs LIMIT 10" }
+  expected: ALLOW
+
+- name: "coding-agent blocked from path traversal"
+  org_id: "acme"
+  agent_id: "coding-agent"
+  server: "filesystem"
+  tool: "read_file"
+  arguments: { path: "/workspace/../../etc/passwd" }
+  expected: DENY
