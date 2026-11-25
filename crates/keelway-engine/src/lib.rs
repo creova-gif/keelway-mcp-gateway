@@ -201,6 +201,7 @@ impl GatewayEngine {
             false,
         )?);
         let app = build_http_router(runtime);
+        self.spawn_hot_reload_watcher();
         let listener = tokio::net::TcpListener::bind(&self.config.bind_addr).await?;
         tracing::info!(
             "keelway MCP gateway listening on http://{}/mcp",
@@ -240,7 +241,90 @@ impl GatewayEngine {
             &DefaultSecretProvider,
             true, // Strict stderr-only console output in stdio mode
         )?);
+        self.spawn_hot_reload_watcher();
         serve_stdio_loop(runtime, principal).await
+    }
+
+    /// Spawns a background Tokio task that polls `policy_files` mtimes every 1 second
+    /// (and listens for `SIGHUP` on Unix) to atomically hot-reload Cedar policies.
+    fn spawn_hot_reload_watcher(&self) {
+        let config = self.config.clone();
+        let base_dir = self.base_dir.clone();
+        let policy = Arc::clone(&self.policy);
+        let policy_paths: Vec<PathBuf> = config
+            .policy_files
+            .iter()
+            .map(|p| {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    base_dir.join(p)
+                }
+            })
+            .collect();
+
+        tokio::spawn(async move {
+            let mut last_mtimes = read_policy_mtimes(&policy_paths);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Consume the immediate initial tick so polling begins after 1 second.
+            interval.tick().await;
+
+            #[cfg(unix)]
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(sig) => Some(sig),
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to register SIGHUP handler for policy hot-reload"
+                        );
+                        None
+                    }
+                };
+
+            loop {
+                #[cfg(unix)]
+                {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if !policy_paths.is_empty() {
+                                let current_mtimes = read_policy_mtimes(&policy_paths);
+                                if current_mtimes != last_mtimes {
+                                    last_mtimes = current_mtimes;
+                                    perform_hot_reload(&policy, &config, &base_dir, "poll");
+                                }
+                            }
+                        }
+                        recv = async {
+                            match sighup.as_mut() {
+                                Some(sig) => sig.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            if recv.is_none() {
+                                sighup = None;
+                            } else {
+                                last_mtimes = read_policy_mtimes(&policy_paths);
+                                perform_hot_reload(&policy, &config, &base_dir, "sighup");
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(not(unix))]
+                {
+                    interval.tick().await;
+                    if !policy_paths.is_empty() {
+                        let current_mtimes = read_policy_mtimes(&policy_paths);
+                        if current_mtimes != last_mtimes {
+                            last_mtimes = current_mtimes;
+                            perform_hot_reload(&policy, &config, &base_dir, "poll");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     fn resolve_principal_id(&self, principal_id: &str) -> Result<Principal, KeelwayError> {
@@ -267,6 +351,37 @@ impl GatewayEngine {
             self.config.tape_path.clone()
         } else {
             self.base_dir.join(&self.config.tape_path)
+        }
+    }
+}
+
+fn read_policy_mtimes(paths: &[PathBuf]) -> Vec<Option<std::time::SystemTime>> {
+    paths
+        .iter()
+        .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect()
+}
+
+fn perform_hot_reload(
+    policy: &PolicyEngine,
+    config: &GatewayConfig,
+    base_dir: &Path,
+    trigger: &str,
+) {
+    match policy.hot_reload_from_files(config, base_dir) {
+        Ok(digest) => {
+            tracing::info!(
+                trigger = trigger,
+                policy_digest = %digest,
+                "hot-reloaded Cedar policies"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                trigger = trigger,
+                error = %err,
+                "hot-reload rejected; keeping last known-good policy snapshot live"
+            );
         }
     }
 }

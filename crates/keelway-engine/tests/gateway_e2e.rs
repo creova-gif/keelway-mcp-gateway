@@ -619,3 +619,135 @@ async fn stdio_upstream_crash_returns_32003_and_records_crashed_receipt() -> Res
 
     Ok(())
 }
+
+#[tokio::test]
+async fn live_http_gateway_hot_reloads_policy_without_downtime() -> Result<(), KeelwayError> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mock_url = spawn_mock_mcp_server(None, calls.clone()).await?;
+
+    let dir = tempdir()?;
+    let policies_dir = dir.path().join("policies");
+    std::fs::create_dir_all(&policies_dir)?;
+    let policy_path = policies_dir.join("default.cedar");
+    let config_path = dir.path().join("keelway.yaml");
+    let tape_path = dir.path().join("keelway-hot-reload-tape.jsonl");
+
+    let initial_cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"github/read_repository"
+);
+"#;
+    std::fs::write(&policy_path, initial_cedar)?;
+
+    let yaml = format!(
+        r#"bind_addr: "127.0.0.1:0"
+tape_path: "{}"
+policy_files:
+  - "policies/default.cedar"
+principals:
+  - org_id: "acme"
+    agent_id: "coding-agent"
+    roles:
+      - "developer"
+    token_ref: "tok-hot-reload"
+servers:
+  - alias: "github"
+    timeout_ms: 5000
+    tools:
+      - "read_repository"
+    transport:
+      type: "streamable_http"
+      url: "{}"
+"#,
+        tape_path.display(),
+        mock_url
+    );
+    std::fs::write(&config_path, yaml)?;
+
+    let engine = GatewayEngine::from_config_file(&config_path)?;
+    let provider = MapSecrets(HashMap::new());
+    let router = engine.build_test_http_router(tape_path.clone(), &provider)?;
+
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    // 1. Initial policy -> ALLOW
+    let allow_resp: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-hot-reload")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "github__read_repository", "arguments": { "repo": "sorvex/keelway" } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(allow_resp["result"]["content"][0]["text"], "ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // 2. Invalid Cedar syntax -> hot_reload() returns Err, last-good snapshot stays live
+    std::fs::write(&policy_path, "this is not valid cedar {{{;")?;
+    assert!(engine.hot_reload().is_err());
+
+    let still_allow_resp: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-hot-reload")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "github__read_repository", "arguments": { "repo": "sorvex/keelway" } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(still_allow_resp["result"]["content"][0]["text"], "ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // 3. Valid tighter policy (forbid github/read_repository) -> hot_reload() succeeds and blocks immediately
+    let tighter_cedar = r#"
+forbid(
+    principal,
+    action == Action::"call_tool",
+    resource == Tool::"github/read_repository"
+);
+"#;
+    std::fs::write(&policy_path, tighter_cedar)?;
+    assert!(engine.hot_reload().is_ok());
+
+    let blocked_resp: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-hot-reload")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "github__read_repository", "arguments": { "repo": "sorvex/keelway" } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(blocked_resp["error"]["code"], -32000);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    Ok(())
+}
