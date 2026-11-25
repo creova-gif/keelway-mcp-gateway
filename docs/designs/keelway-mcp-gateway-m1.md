@@ -282,10 +282,10 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Surfaced by: Section 3 Test Review (22 gaps / 8 E2E flows)
   - Files: `crates/keelway-cli/src/main.rs`, `examples/three-server-demo/`, `crates/keelway-engine/tests/`
   - Verify: `cargo test --workspace`
-- [x] **T7 (P2, human: ~1d / CC: ~30min)** — `benchmarks` — Run 90-min Agentgateway vs ToolHive hands-on DX comparison and add `criterion` p50/p95 latency harness to verify `< 5 ms` p95 overhead target
+- [ ] **T7 (P2, human: ~1d / CC: ~30min)** — `benchmarks` — Partial: `criterion` release latency benchmark (`cargo bench -p keelway-engine --bench gateway_overhead`) and architecture-based comparison in `benchmarks/competitor-dx-notes.md` are done; 90-min live hands-on run of Agentgateway & ToolHive remains open as a follow-up in `benchmarks/competitor-dx-notes.md`
   - Surfaced by: Reality row `perf-table` & Office Hours Assignment
   - Files: `benchmarks/competitor-dx-notes.md`, `benchmarks/`
-  - Verify: `cargo bench`
+  - Verify: `cargo bench` (done); live 90-min Agentgateway vs ToolHive hands-on run (pending)
 
 ### Unresolved Decisions
 None.
