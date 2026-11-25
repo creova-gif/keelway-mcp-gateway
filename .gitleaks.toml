@@ -1,0 +1,22 @@
+title = "Keelway MCP Gateway Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allow synthetic test tokens and benchmark fixtures (including historical commit fingerprint 4973f766cd0a458962c2f62cf603371264ab5b79:crates/keelway-engine/src/secrets.rs:generic-api-key:271)"
+paths = [
+    '''crates/keelway-engine/src/secrets\.rs''',
+    '''crates/keelway-engine/tests/.*''',
+    '''crates/keelway-engine/benches/.*''',
+]
+commits = [
+    "4973f766cd0a458962c2f62cf603371264ab5b79",
+]
+stopwords = [
+    "sk_live_boundary_secret_987654",
+    "ghp_super_secret_token_12345",
+    "ghp_e2e_super_secret_token_99999",
+    "ghp_stdio_child_secret_token_88888",
+    "db_password_very_secret_99",
+]
