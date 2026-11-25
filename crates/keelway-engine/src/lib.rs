@@ -57,6 +57,7 @@ pub struct GatewayEngine {
     base_dir: PathBuf,
     policy: Arc<PolicyEngine>,
     roles_by_principal: HashMap<(String, String), Vec<String>>,
+    initial_policy_mtimes: Vec<Option<std::time::SystemTime>>,
 }
 
 impl GatewayEngine {
@@ -73,6 +74,18 @@ impl GatewayEngine {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        let policy_paths: Vec<PathBuf> = config
+            .policy_files
+            .iter()
+            .map(|p| {
+                if p.is_absolute() {
+                    p.clone()
+                } else {
+                    base_dir.join(p)
+                }
+            })
+            .collect();
+        let initial_policy_mtimes = read_policy_mtimes(&policy_paths);
         let policy = Arc::new(PolicyEngine::from_config_files(&config, &base_dir)?);
         let roles_by_principal = config
             .principals
@@ -84,6 +97,7 @@ impl GatewayEngine {
             base_dir,
             policy,
             roles_by_principal,
+            initial_policy_mtimes,
         })
     }
 
@@ -100,6 +114,7 @@ impl GatewayEngine {
             base_dir: PathBuf::from("."),
             policy,
             roles_by_principal,
+            initial_policy_mtimes: Vec::new(),
         })
     }
 
@@ -263,25 +278,31 @@ impl GatewayEngine {
             })
             .collect();
 
+        let mut last_mtimes = if self.initial_policy_mtimes.len() == policy_paths.len() {
+            self.initial_policy_mtimes.clone()
+        } else {
+            read_policy_mtimes(&policy_paths)
+        };
+
+        // Register SIGHUP synchronously before spawning so early reload signals cannot terminate the process.
+        #[cfg(unix)]
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(sig) => Some(sig),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to register SIGHUP handler for policy hot-reload"
+                );
+                None
+            }
+        };
+
         tokio::spawn(async move {
-            let mut last_mtimes = read_policy_mtimes(&policy_paths);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Consume the immediate initial tick so polling begins after 1 second.
             interval.tick().await;
-
-            #[cfg(unix)]
-            let mut sighup =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
-                    Ok(sig) => Some(sig),
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to register SIGHUP handler for policy hot-reload"
-                        );
-                        None
-                    }
-                };
 
             loop {
                 #[cfg(unix)]
