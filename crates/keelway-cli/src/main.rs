@@ -503,3 +503,157 @@ permit(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "keelway-cli-{label}-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn os_args(items: &[&std::ffi::OsStr]) -> Vec<OsString> {
+        items.iter().map(|s| (*s).to_os_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn cli_init_policy_test_and_attack_simulate_succeed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("init-policy-attack")?;
+        let dir = tmp.path();
+        let config = dir.join("keelway.yaml");
+        let tests_file = dir.join("policies/tests.yaml");
+        let scenarios = dir.join("attacks/prompt-injection.yaml");
+
+        let init_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "init".as_ref(),
+            "--dir".as_ref(),
+            dir.as_os_str(),
+        ]))?;
+        assert_eq!(run(init_cli).await?, ExitCode::SUCCESS);
+
+        let policy_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "policy".as_ref(),
+            "test".as_ref(),
+            "--config".as_ref(),
+            config.as_os_str(),
+            "--tests".as_ref(),
+            tests_file.as_os_str(),
+        ]))?;
+        assert_eq!(run(policy_cli).await?, ExitCode::SUCCESS);
+
+        let attack_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "attack".as_ref(),
+            "simulate".as_ref(),
+            "--config".as_ref(),
+            config.as_os_str(),
+            "--scenarios".as_ref(),
+            scenarios.as_os_str(),
+        ]))?;
+        assert_eq!(run(attack_cli).await?, ExitCode::SUCCESS);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_stdio_without_principal_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("stdio-fail-closed")?;
+        let dir = tmp.path();
+        let config = dir.join("keelway.yaml");
+
+        let init_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "init".as_ref(),
+            "--dir".as_ref(),
+            dir.as_os_str(),
+        ]))?;
+        assert_eq!(run(init_cli).await?, ExitCode::SUCCESS);
+
+        let gateway_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "gateway".as_ref(),
+            "up".as_ref(),
+            "--config".as_ref(),
+            config.as_os_str(),
+            "--transport".as_ref(),
+            "stdio".as_ref(),
+        ]))?;
+        assert_eq!(run(gateway_cli).await?, ExitCode::FAILURE);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_trace_inspect_and_replay_dry_run_work_on_empty_or_valid_tape()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("trace-replay")?;
+        let dir = tmp.path();
+        let config = dir.join("keelway.yaml");
+        let tape = dir.join("keelway-tape.jsonl");
+
+        let init_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "init".as_ref(),
+            "--dir".as_ref(),
+            dir.as_os_str(),
+        ]))?;
+        assert_eq!(run(init_cli).await?, ExitCode::SUCCESS);
+
+        fs::write(&tape, "")?;
+
+        let inspect_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "trace".as_ref(),
+            "inspect".as_ref(),
+            "--tape".as_ref(),
+            tape.as_os_str(),
+        ]))?;
+        assert_eq!(run(inspect_cli).await?, ExitCode::SUCCESS);
+
+        let replay_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "replay".as_ref(),
+            "--config".as_ref(),
+            config.as_os_str(),
+            "--tape".as_ref(),
+            tape.as_os_str(),
+            "--dry-run".as_ref(),
+        ]))?;
+        assert_eq!(run(replay_cli).await?, ExitCode::SUCCESS);
+
+        Ok(())
+    }
+}
