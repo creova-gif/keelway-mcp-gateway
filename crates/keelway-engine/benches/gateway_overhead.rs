@@ -1,4 +1,34 @@
-use keelway_engine::core::{GatewayConfig, KeelwayError, Principal, ToolCall};
+pub use keelway_engine::core;
+
+mod policy {
+    use crate::core::{KeelwayError, PolicyDecision, Principal, ToolCall};
+
+    pub struct PolicyEngine;
+
+    impl PolicyEngine {
+        pub fn inspected_arg_pointers(&self, _server: &str, _tool: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        pub fn evaluate(
+            &self,
+            _principal: &Principal,
+            _tool_call: &ToolCall,
+        ) -> Result<PolicyDecision, KeelwayError> {
+            Err(KeelwayError::Policy("unused in tape bench".to_owned()))
+        }
+    }
+}
+
+#[allow(dead_code, unused_imports)]
+#[path = "../src/tape.rs"]
+mod tape;
+
+use chrono::Utc;
+use keelway_engine::core::{
+    Decision, ExecutionOutcome, Explanation, GatewayConfig, KeelwayError, Principal, ReceiptState,
+    ToolCall, UnsealedReceipt,
+};
 use keelway_engine::{
     GatewayEngine, PrincipalConfig, SecretScrubber, ServerConfig, UpstreamTransport,
     ValidatorBinding, ValidatorKind,
@@ -6,7 +36,10 @@ use keelway_engine::{
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
+use tempfile::tempdir;
+use tokio::sync::Barrier;
 
 const BENCH_CEDAR: &str = r#"
 permit(
@@ -101,9 +134,9 @@ fn run_bench() -> Result<(), KeelwayError> {
 
     let engine = GatewayEngine::from_in_memory(cfg, BENCH_CEDAR)?;
     let scrubber = SecretScrubber::new([
-        "ghp_benchmark_secret_token_000001",
-        "sk_live_benchmark_secret_000002",
-        "postgres_password_secret_000003",
+        "ghp_benchmark_secret_token_000001", // gitleaks:allow
+        "sk_live_benchmark_secret_000002",   // gitleaks:allow
+        "postgres_password_secret_000003",   // gitleaks:allow
     ])?;
 
     let dev = Principal {
@@ -166,6 +199,80 @@ fn run_bench() -> Result<(), KeelwayError> {
         percentile_us(&sql_lat, 0.50) / 1000.0,
         percentile_us(&sql_lat, 0.95) / 1000.0,
         percentile_us(&sql_lat, 0.99) / 1000.0,
+    );
+
+    const TAPE_BURSTS: usize = 10;
+    const TAPE_CONCURRENCY: usize = 50;
+    const TAPE_TOTAL: usize = TAPE_BURSTS * TAPE_CONCURRENCY;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let mut tape_lat = rt.block_on(async {
+        let dir = tempdir()?;
+        let tape_path = dir.path().join("keelway-tape.jsonl");
+        let writer = tape::TapeWriter::open(tape_path.clone())?;
+        let mut latencies_us = Vec::with_capacity(TAPE_TOTAL);
+
+        for burst in 0..TAPE_BURSTS {
+            let barrier = Arc::new(Barrier::new(TAPE_CONCURRENCY));
+            let mut handles = Vec::with_capacity(TAPE_CONCURRENCY);
+            for slot in 0..TAPE_CONCURRENCY {
+                let w = writer.clone();
+                let b = Arc::clone(&barrier);
+                let idx = burst * TAPE_CONCURRENCY + slot;
+                handles.push(tokio::spawn(async move {
+                    let unsealed = UnsealedReceipt {
+                        timestamp: Utc::now(),
+                        org_id: "acme".to_owned(),
+                        agent_id: "coding-agent".to_owned(),
+                        server: "github".to_owned(),
+                        tool: "read_repository".to_owned(),
+                        redacted_args: json!({ "repo": "sorvex/keelway", "seq_hint": idx }),
+                        redacted_fields: vec![],
+                        decision: Decision::Allow,
+                        explanation: Explanation {
+                            decision: Decision::Allow,
+                            rule_ids: vec!["policy0".to_owned()],
+                            validator_outcomes: vec![],
+                            reason: "allowed by policy0".to_owned(),
+                            policy_digest: "bench_digest".to_owned(),
+                        },
+                        policy_digest: "bench_digest".to_owned(),
+                        state: ReceiptState::Sealed,
+                        outcome: Some(ExecutionOutcome::Ok),
+                        provenance: None,
+                    };
+                    b.wait().await;
+                    let t0 = Instant::now();
+                    let _ = w.append(unsealed).await?;
+                    Ok::<u128, KeelwayError>(t0.elapsed().as_micros())
+                }));
+            }
+            for h in handles {
+                let elapsed = h.await.map_err(|e| {
+                    KeelwayError::Tape(format!("benchmark task join failed: {e}"))
+                })??;
+                latencies_us.push(elapsed);
+            }
+        }
+        drop(writer);
+        let verified = tape::verify_tape(&tape_path)?;
+        if !verified.valid || verified.count != TAPE_TOTAL as u64 {
+            return Err(KeelwayError::Tape(format!(
+                "unexpected tape verification count={} valid={}",
+                verified.count, verified.valid
+            )));
+        }
+        Ok::<Vec<u128>, KeelwayError>(latencies_us)
+    })?;
+    tape_lat.sort_unstable();
+
+    println!(
+        "  TapeWriter 50-way burst fsync  : p50 = {:.3} ms | p95 = {:.3} ms | p99 = {:.3} ms (N={TAPE_TOTAL}, {TAPE_BURSTS}x{TAPE_CONCURRENCY})",
+        percentile_us(&tape_lat, 0.50) / 1000.0,
+        percentile_us(&tape_lat, 0.95) / 1000.0,
+        percentile_us(&tape_lat, 0.99) / 1000.0,
     );
     Ok(())
 }

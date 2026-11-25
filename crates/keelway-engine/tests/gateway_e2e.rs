@@ -4,8 +4,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use keelway_engine::core::{Decision, GatewayConfig, KeelwayError};
 use keelway_engine::{
-    GatewayEngine, PrincipalConfig, ReplayVerdict, SecretProvider, ServerConfig, UpstreamTransport,
-    ValidatorBinding, ValidatorKind,
+    ExecutionOutcome, GatewayEngine, PrincipalConfig, Receipt, ReceiptState, ReplayVerdict,
+    SecretProvider, ServerConfig, UpstreamTransport, ValidatorBinding, ValidatorKind,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -110,7 +110,7 @@ permit(
 #[tokio::test]
 async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Result<(), KeelwayError>
 {
-    let github_secret = "ghp_e2e_super_secret_token_99999";
+    let github_secret = "ghp_e2e_super_secret_token_99999"; // gitleaks:allow
     let github_calls = Arc::new(AtomicUsize::new(0));
     let db_calls = Arc::new(AtomicUsize::new(0));
     let fs_calls = Arc::new(AtomicUsize::new(0));
@@ -330,6 +330,292 @@ forbid(principal, action == Action::"call_tool", resource);
         replayed[3].replayed_verdict,
         ReplayVerdict::Indeterminate { .. }
     ));
+
+    Ok(())
+}
+
+const CEDAR_STDIO: &str = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"list_tool",
+    resource == Tool::"localstdio/echo_secret"
+);
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"localstdio/echo_secret"
+);
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"slowstdio/hang_tool"
+);
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"crashstdio/crash_tool"
+);
+"#;
+
+#[tokio::test]
+async fn stdio_upstream_federation_injects_env_and_scrubs_stdout_and_stderr()
+-> Result<(), KeelwayError> {
+    let stdio_secret = "ghp_stdio_child_secret_token_88888"; // gitleaks:allow
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-stdio-tape.jsonl");
+
+    let mut stdio_env = BTreeMap::new();
+    stdio_env.insert(
+        "STDIO_SECRET".to_owned(),
+        "secret://env/STDIO_SECRET".to_owned(),
+    );
+
+    let script = concat!(
+        "read -r _line; ",
+        "if [ -n \"$STDIO_SECRET\" ]; then injected=true; else injected=false; fi; ",
+        "printf 'stderr_leak=%s\\n' \"$STDIO_SECRET\" >&2; ",
+        "printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"stdio_ok env_injected=%s leaked=%s\"}]}}\\n' \"$injected\" \"$STDIO_SECRET\""
+    );
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-stdio".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "localstdio".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["echo_secret".to_owned()],
+            transport: UpstreamTransport::Stdio {
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), script.to_owned()],
+                env: stdio_env,
+            },
+        }],
+        validators: vec![],
+    };
+
+    let mut secret_map = HashMap::new();
+    secret_map.insert(
+        "secret://env/STDIO_SECRET".to_owned(),
+        stdio_secret.to_owned(),
+    );
+    let provider = MapSecrets(secret_map);
+
+    let engine = GatewayEngine::from_in_memory(cfg, CEDAR_STDIO)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &provider)?;
+
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    let resp: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-stdio")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "localstdio__echo_secret",
+                "arguments": { "ping": "pong" }
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("env_injected=true"));
+    assert!(text.contains("leaked=[REDACTED]"));
+    assert!(!text.contains(stdio_secret));
+
+    let raw_tape = std::fs::read_to_string(&tape_path)?;
+    assert!(!raw_tape.contains(stdio_secret));
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let verified = GatewayEngine::inspect_tape(&tape_path, |r| {
+        receipts.push(r);
+        Ok(())
+    })?;
+    assert!(verified.valid);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].decision, Decision::Allow);
+    assert_eq!(receipts[0].state, ReceiptState::Sealed);
+    assert_eq!(receipts[0].server, "localstdio");
+    assert_eq!(receipts[0].tool, "echo_secret");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_upstream_timeout_returns_32002_and_records_timeout_receipt()
+-> Result<(), KeelwayError> {
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-timeout-tape.jsonl");
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-timeout".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "slowstdio".to_owned(),
+            timeout_ms: 50,
+            tools: vec!["hang_tool".to_owned()],
+            transport: UpstreamTransport::Stdio {
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 2".to_owned()],
+                env: BTreeMap::new(),
+            },
+        }],
+        validators: vec![],
+    };
+
+    let provider = MapSecrets(HashMap::new());
+    let engine = GatewayEngine::from_in_memory(cfg, CEDAR_STDIO)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &provider)?;
+
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    let resp: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-timeout")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "slowstdio__hang_tool",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+
+    assert_eq!(resp["error"]["code"], -32002);
+    let err_msg = resp["error"]["message"].as_str().unwrap_or("");
+    assert!(err_msg.contains("UpstreamTimeout"));
+
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let verified = GatewayEngine::inspect_tape(&tape_path, |r| {
+        receipts.push(r);
+        Ok(())
+    })?;
+    assert!(verified.valid);
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].decision, Decision::Allow);
+    assert_eq!(receipts[0].outcome, None);
+    assert_eq!(receipts[1].decision, Decision::Allow);
+    assert_eq!(receipts[1].outcome, Some(ExecutionOutcome::Timeout));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_upstream_crash_returns_32003_and_records_crashed_receipt() -> Result<(), KeelwayError>
+{
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-crash-tape.jsonl");
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-crash".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "crashstdio".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["crash_tool".to_owned()],
+            transport: UpstreamTransport::Stdio {
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "exit 1".to_owned()],
+                env: BTreeMap::new(),
+            },
+        }],
+        validators: vec![],
+    };
+
+    let provider = MapSecrets(HashMap::new());
+    let engine = GatewayEngine::from_in_memory(cfg, CEDAR_STDIO)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &provider)?;
+
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    let resp: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-crash")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {
+                "name": "crashstdio__crash_tool",
+                "arguments": {}
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+
+    assert_eq!(resp["error"]["code"], -32003);
+    let err_msg = resp["error"]["message"].as_str().unwrap_or("");
+    assert!(err_msg.contains("UpstreamUnavailable"));
+
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let verified = GatewayEngine::inspect_tape(&tape_path, |r| {
+        receipts.push(r);
+        Ok(())
+    })?;
+    assert!(verified.valid);
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].decision, Decision::Allow);
+    assert_eq!(receipts[0].outcome, None);
+    assert_eq!(receipts[1].decision, Decision::Allow);
+    assert_eq!(receipts[1].outcome, Some(ExecutionOutcome::Crashed));
 
     Ok(())
 }

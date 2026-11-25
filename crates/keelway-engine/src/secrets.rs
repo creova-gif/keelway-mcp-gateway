@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn scrubs_raw_json_url_and_base64_variants() -> Result<(), KeelwayError> {
-        let secret = "ghp_super_secret_token_12345";
+        let secret = "ghp_super_secret_token_12345"; // gitleaks:allow
         let scrubber = SecretScrubber::new([secret])?;
         let b64 = BASE64_STANDARD.encode(secret.as_bytes());
         let url = utf8_percent_encode(secret, NON_ALPHANUMERIC).to_string();
@@ -268,13 +268,13 @@ mod tests {
 
     #[test]
     fn streaming_scrubber_catches_chunk_straddling_secret() -> Result<(), KeelwayError> {
-        let secret = "sk_live_boundary_secret_987654";
+        let secret = "sk_live_boundary_secret_987654"; // gitleaks:allow
         let scrubber = SecretScrubber::new([secret])?;
         let mut stream = scrubber.streaming();
         let mut assembled = String::new();
         // Split right through the middle of the secret
-        assembled.push_str(&stream.push_chunk("hello sk_live_bound"));
-        assembled.push_str(&stream.push_chunk("ary_secret_987654 world"));
+        assembled.push_str(&stream.push_chunk("hello sk_live_bound")); // gitleaks:allow
+        assembled.push_str(&stream.push_chunk("ary_secret_987654 world")); // gitleaks:allow
         assembled.push_str(&stream.finish());
         assert!(!assembled.contains(secret));
         assert_eq!(assembled, "hello [REDACTED] world");
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn scrub_json_records_exact_redacted_field_pointers() -> Result<(), KeelwayError> {
-        let secret = "db_password_very_secret_99";
+        let secret = "db_password_very_secret_99"; // gitleaks:allow
         let scrubber = SecretScrubber::new([secret])?;
         let args = json!({
             "repo": "sorvex/keelway",

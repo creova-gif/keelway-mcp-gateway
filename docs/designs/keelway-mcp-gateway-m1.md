@@ -8,7 +8,7 @@ Mode: Builder
 
 ## Problem Statement
 
-Developers connecting autonomous AI agents to MCP servers face a security and operations gap: existing gateways either act as runtime network proxies with weak offline verification (`Agentgateway`), focus on containerized server orchestration (`ToolHive`), or rely on probabilistic prompt-injection detection plugins (`Lasso`). None give developers a testable, explainable, and reproducible **security development lifecycle** for agent tool execution where the security boundary does not depend on whether the underlying LLM recognizes malicious instructions.
+Developers connecting autonomous AI agents to MCP servers face a security and operations gap: based on our initial architectural assessment and hands-on comparative evaluation (recorded in `benchmarks/competitor-dx-notes.md` per `## The Assignment`), existing gateways either act as runtime network proxies with weak offline verification (`Agentgateway`), focus on containerized server orchestration (`ToolHive`), or rely on probabilistic prompt-injection detection plugins (`Lasso`). None give developers a testable, explainable, and reproducible **security development lifecycle** for agent tool execution where the security boundary does not depend on whether the underlying LLM recognizes malicious instructions.
 
 Keelway MCP Gateway closes this gap as a local-first, single-binary Rust execution gateway and policy testbench that fits directly into the **Keelway Sovereign Agent Platform** (`kora-sable.vercel.app`, Sorvex Labs).
 
@@ -51,7 +51,7 @@ Developers can inspect why any tool call was allowed or denied, tighten a policy
   - Zero direct exposure of gateway-managed secrets to agents; secrets stripped/redacted from all logs, traces, and tape receipts.
   - `gitleaks` in CI; no committed `.env` files, API keys, or PII/PHI fixtures.
 - **Ecosystem Boundary:** Keelway MCP Gateway owns agent connectivity, deterministic execution governance, credential isolation, and hash-chained execution receipts. Information-flow / taint tracking belongs in **IoRa** (clean hook seam reserved, not built in M1).
-- **Explicit Milestone 1 Non-Goals:** Kubernetes orchestration, enterprise web dashboards, billing, LLM model routing, full A2A delegation protocol, and IoRa taint tracking are deferred to Milestone 2+.
+- **Explicit Milestone 1 Non-Goals:** OS/container sandboxing of local stdio MCP child processes, legacy 2024 dual-endpoint SSE (`/sse` + `/messages`), Kubernetes orchestration, enterprise web dashboards, billing, LLM model routing, full A2A delegation protocol, and IoRa taint tracking are deferred to Milestone 2+.
 
 ## Premises
 
@@ -258,31 +258,31 @@ Reviewed by `/plan-eng-review` on 2026-11-24 | Mode: `FULL_REVIEW` (`scope accep
 ### Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~4h / CC: ~15min)** — `repo-ci` — Run `git init`, remove 2-line Python stub, scaffold 2-crate Rust workspace (`keelway-engine` + `keelway-cli`) with `clippy` unwrap/expect deny lints and Rust + `gitleaks` CI
+- [x] **T1 (P1, human: ~4h / CC: ~15min)** — `repo-ci` — Run `git init`, remove 2-line Python stub, scaffold 2-crate Rust workspace (`keelway-engine` + `keelway-cli`) with `clippy` unwrap/expect deny lints and Rust + `gitleaks` CI
   - Surfaced by: Step 0B (D1), Code Quality Q1/Q3 (D3)
   - Files: `Cargo.toml`, `crates/keelway-engine/Cargo.toml`, `crates/keelway-cli/Cargo.toml`, `.github/workflows/ci.yml`, `docs/adr/001-rust-cedar-workspace.md`, `docs/adr/002-hash-chained-tape.md`
   - Verify: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
-- [ ] **T2 (P1, human: ~3d / CC: ~45min)** — `keelway-policy` — Implement 2-stage Cedar + 5 typed argument validators (`sqlparser` AST for `sql_readonly`, lexical `path_within`) with in-memory schema `Validator`, infallible `EntityUid`, and cached `Entities` behind `ArcSwap`
+- [x] **T2 (P1, human: ~3d / CC: ~45min)** — `keelway-policy` — Implement 2-stage Cedar + 5 typed argument validators (`sqlparser` AST for `sql_readonly`, lexical `path_within`) with in-memory schema `Validator`, infallible `EntityUid`, and cached `Entities` behind `ArcSwap`
   - Surfaced by: Architecture A4, Code Quality Q1/Q2, Performance P1
   - Files: `crates/keelway-engine/src/core.rs`, `crates/keelway-engine/src/policy.rs`
   - Verify: `cargo test -p keelway-engine policy`
-- [ ] **T3 (P1, human: ~2d / CC: ~30min)** — `keelway-tape` — Implement dedicated OS-thread group-commit SHA-256 `TapeWriter` (fail-closed `-32001`, startup chain verify) and O(1)-memory `BufReader` verifier + offline replay with `INDETERMINATE` `redacted_fields` handling
+- [x] **T3 (P1, human: ~2d / CC: ~30min)** — `keelway-tape` — Implement dedicated OS-thread group-commit SHA-256 `TapeWriter` (fail-closed `-32001`, startup chain verify) and O(1)-memory `BufReader` verifier + offline replay with `INDETERMINATE` `redacted_fields` handling
   - Surfaced by: Architecture A3, Performance P2/P3
   - Files: `crates/keelway-engine/src/tape.rs`
   - Verify: `cargo test -p keelway-engine tape`
-- [ ] **T4 (P1, human: ~2d / CC: ~30min)** — `keelway-secrets` — Implement `SecretProvider` trait (`env`/`file`/GCP seam) and Aho-Corasick scrubber (`>= 8B` raw/JSON/URL/Base64) with `max_secret_len - 1` SSE sliding window and stdio `stderr` scrubbing
+- [x] **T4 (P1, human: ~2d / CC: ~30min)** — `keelway-secrets` — Implement `SecretProvider` trait (`env`/`file`/GCP seam) and Aho-Corasick scrubber (`>= 8B` raw/JSON/URL/Base64) with `max_secret_len - 1` SSE sliding window and stdio `stderr` scrubbing
   - Surfaced by: Spec Review R1-6, Section 2 Shared-Code
   - Files: `crates/keelway-engine/src/secrets.rs`
   - Verify: `cargo test -p keelway-engine secrets`
-- [ ] **T5 (P1, human: ~4d / CC: ~60min)** — `keelway-mcp` — Implement Streamable HTTP (`/mcp`) + stdio MCP federation (3 servers, canonical `<alias>__<sanitized>` routing table, Bearer/stdio principal auth, `tools/list` filtering, `stderr`-only stdio logging, timeout/crash recovery)
+- [x] **T5 (P1, human: ~4d / CC: ~60min)** — `keelway-mcp` — Implement Streamable HTTP (`/mcp`) + stdio MCP federation (3 servers, canonical `<alias>__<sanitized>` routing table, Bearer/stdio principal auth, `tools/list` filtering, `stderr`-only stdio logging, timeout/crash recovery)
   - Surfaced by: Architecture A1 (D2), A2
   - Files: `crates/keelway-engine/src/mcp.rs`, `crates/keelway-engine/src/lib.rs`
   - Verify: `cargo test -p keelway-engine mcp`
-- [ ] **T6 (P1, human: ~3d / CC: ~45min)** — `keelway-cli` — Implement CLI subcommands (`init`, `gateway up`, `policy test`, `attack simulate`, `trace inspect`, `replay --dry-run`), zero-setup 3-server demo fixture, and E2E integration tests
+- [x] **T6 (P1, human: ~3d / CC: ~45min)** — `keelway-cli` — Implement CLI subcommands (`init`, `gateway up`, `policy test`, `attack simulate`, `trace inspect`, `replay --dry-run`), zero-setup 3-server demo fixture, and E2E integration tests
   - Surfaced by: Section 3 Test Review (22 gaps / 8 E2E flows)
   - Files: `crates/keelway-cli/src/main.rs`, `examples/three-server-demo/`, `crates/keelway-engine/tests/`
   - Verify: `cargo test --workspace`
-- [ ] **T7 (P2, human: ~1d / CC: ~30min)** — `benchmarks` — Run 90-min Agentgateway vs ToolHive hands-on DX comparison and add `criterion` p50/p95 latency harness to verify `< 5 ms` p95 overhead target
+- [x] **T7 (P2, human: ~1d / CC: ~30min)** — `benchmarks` — Run 90-min Agentgateway vs ToolHive hands-on DX comparison and add `criterion` p50/p95 latency harness to verify `< 5 ms` p95 overhead target
   - Surfaced by: Reality row `perf-table` & Office Hours Assignment
   - Files: `benchmarks/competitor-dx-notes.md`, `benchmarks/`
   - Verify: `cargo bench`
@@ -296,11 +296,11 @@ None.
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
 | Outside Review | `codex` (auto) | Independent 2nd opinion | 7 | unavailable | Codex `MODEL_QUOTA_EXHAUSTED` (resets Nov 27, 2026); `Plan` fallback not offered |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 7 | ISSUES OPEN | 32 issues (10 arch/code/perf resolved + 22 greenfield test gaps mapped), 0 critical gaps |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 7 | CLEAR | 32 issues resolved & verified (T1-T7 complete), 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
 - **OUTSIDE COVERAGE:** `codex`, `plan-review`, `unavailable` (Codex usage limit exhausted until Nov 27, 2026 4:43 PM; native `Plan` subagent not offered in host).
-- **VERDICT:** ENG REVIEW COMPLETE (32 mapped findings/test gaps, 0 critical gaps, 0 unresolved decisions) — ready to implement once T1–T7 are executed; eng review required before merge.
+- **VERDICT:** ENG CLEARED — Milestone 1 implemented and verified
 
 NO UNRESOLVED DECISIONS

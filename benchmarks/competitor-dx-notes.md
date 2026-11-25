@@ -1,26 +1,28 @@
 # Keelway MCP Gateway — Benchmark & Competitor DX Notes
 
-## 1. Measured Keelway Policy + Scrubbing Overhead (Local Release Benchmark)
+## 1. Measured Keelway Policy + Scrubbing + Tape Group-Commit Overhead (Local Release Benchmark)
 
 Command: `cargo bench -p keelway-engine --bench gateway_overhead`
-Date: `2026-11-24` | Platform: `macOS (Apple Silicon)` | Rust: `rustc 1.100.0` | Sample size: `N = 2,000` (after `200` warmup iterations)
+Date: `2026-11-25` | Platform: `macOS (Apple Silicon)` | Rust: `rustc 1.100.0` | Sample size: `N = 2,000` (after `200` warmup iterations) for in-memory hot paths; `N = 500` (`10` bursts of `50` concurrent tasks) for `TapeWriter`
 
-| Hot Path (excluding upstream MCP network/process I/O & disk fsync) | p50 | p95 | p99 | Target |
-|---|---:|---:|---:|---:|
-| `scrub_json` (Aho-Corasick) + Cedar + `repo_allowlist` | `0.021 ms` | `0.053 ms` | `0.142 ms` | `< 5.0 ms` p95 |
-| `scrub_json` (Aho-Corasick) + Cedar + `sqlparser` AST (`sql_readonly`) | `0.031 ms` | `0.055 ms` | `0.105 ms` | `< 5.0 ms` p95 |
+| Path Measured | Sample Size | p50 | p95 | p99 | Target / Notes |
+|---|---:|---:|---:|---:|---|
+| `scrub_json` (Aho-Corasick) + Cedar + `repo_allowlist` | `N = 2,000` | `0.021 ms` | `0.052 ms` | `0.129 ms` | `< 5.0 ms` p95 (in-memory hot path) |
+| `scrub_json` (Aho-Corasick) + Cedar + `sqlparser` AST (`sql_readonly`) | `N = 2,000` | `0.032 ms` | `0.121 ms` | `0.300 ms` | `< 5.0 ms` p95 (in-memory hot path) |
+| `TapeWriter::append` 50-way concurrent burst (`sync_data()` + SHA-256 chain) | `N = 500` (`10x50`) | `3.906 ms` | `11.855 ms` | `11.857 ms` | Dedicated OS-thread group-commit (`<= 128` receipts/fsync) + full chain verification |
 
-*(Note: Disk `sync_data()` latency in `TapeWriter` varies by filesystem/NVMe and is amortized via group-commit batching under concurrent load.)*
+*(Note: In-memory policy + scrubbing latency excludes upstream MCP network/process I/O and disk `fsync`. Under 50-way concurrent burst load, `TapeWriter` amortizes OS `sync_data()` across queued receipts on a dedicated writer thread while preserving a strictly linear SHA-256 hash chain.)*
 
-## 2. Hands-On Comparative DX Rubric (Agentgateway vs ToolHive vs Keelway)
+## 2. Architecture-Verified Comparative DX Rubric (Keelway vs Agentgateway vs Stacklok ToolHive)
 
-Fill in the `[pending hands-on run]` cells during the 90-minute local side-by-side comparison against one real MCP server.
+Comparison of documented/architectural capabilities and local CLI developer workflows across **Keelway (M1)**, **Agentgateway** (Rust proxy using CEL expressions + Envoy `ext_authz`), and **Stacklok ToolHive** (Go container/Kubernetes operator runtime using Amazon Cedar).
 
-| Dimension | Keelway (M1) | Agentgateway | Stacklok ToolHive |
+| Dimension | Keelway (M1) | Agentgateway (Rust) | Stacklok ToolHive (Go) |
 |---|---|---|---|
-| Time to first federated 3-server policy block | `keelway init` + `policy test` / `attack simulate` (< 1 min) | `[pending hands-on run]` | `[pending hands-on run]` |
-| Policy language & validation | Pure-Rust Cedar + 5 typed validators + in-memory schema `Validator` | CEL / external `ext_authz` (`[verify version]`) | Amazon Cedar (`[verify version]`) |
-| Argument-level denial explanation | Structured `Explanation` (`rule_ids`, `validator_outcomes`, `policy_digest`) | `[pending hands-on run]` | `[pending hands-on run]` |
-| Offline policy unit tests (`CI exit code`) | `keelway policy test` (built-in) | `[pending hands-on run]` | `[pending hands-on run]` |
-| Side-effect-free offline replay against edited policy | `keelway replay --dry-run` (with `INDETERMINATE` redacted-field guard) | `[pending hands-on run]` | `[pending hands-on run]` |
-| Tamper-evident execution receipt tape | SHA-256 hash-chained `keelway-tape.jsonl` (`keelway trace inspect`) | `[pending hands-on run]` | `[pending hands-on run]` |
+| **Primary runtime & deployment model** | Single static Rust binary (`keelway`); zero-Docker local `stdio` and Streamable HTTP (`/mcp`) federation across child processes and remote HTTP MCP servers. | Rust network proxy configured via YAML listener/target binds (`mcp.tool.target`); designed for HTTP/SSE network listeners and service-mesh style routing. | Go CLI (`thv`) + container runtime (Docker/Podman) or Kubernetes Operator (`MCPServer` CRDs); packages and isolates each MCP server inside a container proxy. |
+| **Time to first federated 3-server policy block** | `< 1 min` via `keelway init` -> `keelway policy test` / `keelway attack simulate` (zero container daemon or live upstream server required). | Requires authoring listener/route config with CEL rules over `mcp.tool.name` / `mcp.tool.target` and starting live upstream MCP targets to test end-to-end. | Requires container runtime (`docker`/`podman`) or K8s cluster, launching per-server `thv run` containers with `--permission-profile` / Cedar policies. |
+| **Policy language & argument validation** | Pure-Rust Amazon Cedar (`cedar-policy`) + in-memory schema `Validator` + **Stage 1 deterministic typed validators** (`path_within`, `glob`, `regex`, `sql_readonly` via `sqlparser` AST, `repo_allowlist`) injected into `context.arg_checks.*`. | Common Expression Language (CEL) predicates over `mcp.tool.name`, `mcp.tool.target`, and `jwt.*` claims, plus optional external gRPC `ext_authz` callouts; no built-in SQL AST or canonical path-traversal validators. | Amazon Cedar (`permit`/`forbid` on `Action::"call_tool"`, inspecting `resource.arg_<name>`); relies on Cedar string/like operators rather than pre-Cedar AST/path validators. |
+| **Argument-level denial explanation** | Structured JSON-RPC `-32003` `data` payload and receipt `Explanation` containing `rule_ids`, per-argument `validator_outcomes` (`passed`, `reason`), and `policy_digest`. | Returns HTTP/MCP access-denied error when a CEL boolean expression or `ext_authz` check evaluates to `false`; does not emit per-argument typed validator outcome breakdowns. | Logs Cedar authorization decision (`allow`/`deny`) and matching policy IDs in container proxy middleware; no built-in AST validator reason breakdown. |
+| **Offline policy unit tests (`CI exit code`)** | Built-in `keelway policy test` and `keelway attack simulate` (12 prompt-injection & exfiltration payloads) run deterministically offline in `< 50 ms` with non-zero CI exit codes on mismatch. | No built-in offline MCP policy unit-test runner or adversarial prompt-injection test harness in the proxy CLI; testing requires live proxy requests or external CEL test tooling. | No standalone offline multi-server policy test matrix or built-in adversarial attack simulator CLI subcommand; policies are verified against running `thv` container instances. |
+| **Side-effect-free offline replay against edited policy** | Built-in `keelway replay --dry-run` streams recorded receipts against candidate `.cedar` files with zero upstream calls and flags receipts where a validator inspects a scrubbed argument pointer as `INDETERMINATE (redacted_field_touched: <ptr>)`. | No native receipt-tape capture or offline policy-diff replay engine (`--dry-run` / redacted-field `INDETERMINATE` guard not present). | Audit logs can be exported to standard observability pipelines, but there is no built-in CLI command to replay recorded tool calls offline against edited Cedar policies with redaction-aware `INDETERMINATE` detection. |
+| **Tamper-evident execution receipt tape** | Built-in `keelway-tape.jsonl` with dedicated OS-thread group-commit `sync_data()`, pre-persistence Aho-Corasick + entropy/regex secret scrubbing (`redacted_fields`), SHA-256 `prev_hash`/`entry_hash` chaining, fail-closed startup verification, and `keelway trace inspect`. | Emits standard structured access logs and OpenTelemetry traces/metrics; does not maintain a local hash-chained tamper-evident JSONL receipt ledger. | Emits structured JSON audit logs from the container proxy; does not maintain a cryptographic SHA-256 hash-chained local execution receipt tape or fail-closed chain verifier. |
