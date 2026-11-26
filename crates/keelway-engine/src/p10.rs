@@ -25,6 +25,28 @@ struct PendingEntry {
     sender: oneshot::Sender<bool>,
 }
 
+/// RAII guard that cancels a pending P-10 approval gate if dropped before being disarmed.
+#[derive(Debug)]
+pub struct PendingGateGuard {
+    manager: P10GateManager,
+    approval_id: Option<String>,
+}
+
+impl PendingGateGuard {
+    /// Disarms the guard so dropping it will not cancel the pending gate.
+    pub fn disarm(&mut self) {
+        self.approval_id = None;
+    }
+}
+
+impl Drop for PendingGateGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.approval_id.take() {
+            self.manager.cancel(&id);
+        }
+    }
+}
+
 /// Manages P-10 human-in-the-loop approval gates for sensitive tool invocations.
 #[derive(Debug, Clone, Default)]
 pub struct P10GateManager {
@@ -120,18 +142,49 @@ impl P10GateManager {
         items
     }
 
-    /// Resolves a pending gate by `approval_id`, removing it and sending `approved`
-    /// on the associated `oneshot` channel.
-    pub fn resolve(&self, approval_id: &str, approved: bool) -> Result<(), KeelwayError> {
+    /// Returns an RAII guard that cancels `approval_id` on drop unless disarmed.
+    pub fn guard(&self, approval_id: &str) -> PendingGateGuard {
+        PendingGateGuard {
+            manager: self.clone(),
+            approval_id: Some(approval_id.to_owned()),
+        }
+    }
+
+    /// Resolves a pending gate by `approval_id` for `approver_org` and `approver_agent`,
+    /// removing it and sending `approved` on the associated `oneshot` channel.
+    pub fn resolve(
+        &self,
+        approval_id: &str,
+        approver_org: &str,
+        approver_agent: &str,
+        approved: bool,
+    ) -> Result<(), KeelwayError> {
         let mut guard = self
             .pending
             .lock()
             .map_err(|_| KeelwayError::Mcp("approval gate lock poisoned".to_owned()))?;
+        let Some(entry) = guard.get(approval_id) else {
+            return Err(KeelwayError::Mcp(
+                "unknown or expired approval_id".to_owned(),
+            ));
+        };
+        if entry.info.org_id != approver_org {
+            return Err(KeelwayError::Auth(format!(
+                "cross-tenant P-10 resolution forbidden for org '{approver_org}'"
+            )));
+        }
+        if entry.info.agent_id == approver_agent {
+            return Err(KeelwayError::Auth(format!(
+                "self-approval forbidden for agent '{approver_agent}'"
+            )));
+        }
         let entry = guard
             .remove(approval_id)
             .ok_or_else(|| KeelwayError::Mcp("unknown or expired approval_id".to_owned()))?;
-        let _ = entry.sender.send(approved);
-        Ok(())
+        drop(guard);
+        entry.sender.send(approved).map_err(|_| {
+            KeelwayError::Mcp(format!("approval waiter disconnected for '{approval_id}'"))
+        })
     }
 
     /// Removes a pending gate without resolving it (e.g. on timeout or drop).
@@ -227,7 +280,7 @@ mod tests {
             json!({"repo": "keelway", "token": "[REDACTED]"})
         );
 
-        mgr.resolve(&id, true)?;
+        mgr.resolve(&id, "org-a", "approver-1", true)?;
         assert!(mgr.list_pending().is_empty());
         assert!(rx.await?);
         Ok(())
@@ -244,7 +297,7 @@ mod tests {
             json!({}),
         );
 
-        mgr.resolve(&id, false)?;
+        mgr.resolve(&id, "org-a", "approver-1", false)?;
         assert!(mgr.list_pending().is_empty());
         assert!(!rx.await?);
         Ok(())
@@ -269,7 +322,77 @@ mod tests {
     #[test]
     fn resolve_unknown_id_returns_err() {
         let mgr = P10GateManager::new(Vec::new());
-        let err = mgr.resolve("nonexistent-id", true);
+        let err = mgr.resolve("nonexistent-id", "org-a", "approver-1", true);
         assert!(matches!(err, Err(KeelwayError::Mcp(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_cross_tenant_and_self_approval_rejected_without_removing_gate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mgr = P10GateManager::new(Vec::new());
+        let (id, rx) = mgr.create_gate(
+            &principal("org-a", "agent-1"),
+            "github",
+            "delete_repo",
+            json!({}),
+        );
+
+        let cross_err = mgr.resolve(&id, "org-b", "approver-1", true);
+        assert!(matches!(cross_err, Err(KeelwayError::Auth(_))));
+        assert_eq!(mgr.pending_count(), 1);
+
+        let self_err = mgr.resolve(&id, "org-a", "agent-1", true);
+        assert!(matches!(self_err, Err(KeelwayError::Auth(_))));
+        assert_eq!(mgr.pending_count(), 1);
+
+        mgr.resolve(&id, "org-a", "approver-1", true)?;
+        assert!(rx.await?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_disconnected_waiter_returns_err() {
+        let mgr = P10GateManager::new(Vec::new());
+        let (id, rx) = mgr.create_gate(
+            &principal("org-a", "agent-1"),
+            "github",
+            "delete_repo",
+            json!({}),
+        );
+        drop(rx);
+
+        let err = mgr.resolve(&id, "org-a", "approver-1", true);
+        assert!(matches!(err, Err(KeelwayError::Mcp(_))));
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_gate_guard_cancels_on_drop_unless_disarmed() {
+        let mgr = P10GateManager::new(Vec::new());
+
+        let (id1, rx1) = mgr.create_gate(
+            &principal("org-a", "agent-1"),
+            "github",
+            "delete_repo",
+            json!({}),
+        );
+        {
+            let _guard = mgr.guard(&id1);
+            assert_eq!(mgr.pending_count(), 1);
+        }
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(rx1.await.is_err());
+
+        let (id2, _rx2) = mgr.create_gate(
+            &principal("org-a", "agent-1"),
+            "github",
+            "delete_repo",
+            json!({}),
+        );
+        {
+            let mut guard = mgr.guard(&id2);
+            guard.disarm();
+        }
+        assert_eq!(mgr.pending_count(), 1);
     }
 }

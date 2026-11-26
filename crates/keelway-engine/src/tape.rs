@@ -307,6 +307,28 @@ pub fn replay_tape(
 ) -> Result<Vec<ReplayEntry>, KeelwayError> {
     let mut entries = Vec::new();
     stream_receipts(path, |receipt| {
+        if receipt.decision == Decision::Deny
+            && (receipt.explanation.reason == "unauthenticated"
+                || receipt
+                    .explanation
+                    .rule_ids
+                    .iter()
+                    .any(|r| r == "p10_gate" || r == "budget"))
+        {
+            entries.push(ReplayEntry {
+                seq: receipt.seq,
+                org_id: receipt.org_id,
+                agent_id: receipt.agent_id,
+                server: receipt.server,
+                tool: receipt.tool,
+                original_decision: receipt.decision,
+                replayed_verdict: ReplayVerdict::Deny,
+                changed: false,
+                reason: "lifecycle receipt (non-Cedar gate); preserved".to_owned(),
+            });
+            return Ok(());
+        }
+
         let inspected = policy_engine.inspected_arg_pointers(&receipt.server, &receipt.tool);
         let touched: Vec<String> = receipt
             .redacted_fields
@@ -376,7 +398,8 @@ pub fn replay_tape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Explanation, ReceiptState};
+    use crate::ReceiptState;
+    use crate::core::Explanation;
     use chrono::Utc;
     use serde_json::json;
     use tempfile::tempdir;

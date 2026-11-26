@@ -967,12 +967,26 @@ async fn p10_human_gate_and_observability_endpoints_work_end_to_end() -> Result<
             tool: "query_readonly".to_owned(),
             timeout_ms: 5_000,
         }],
-        principals: vec![PrincipalConfig {
-            org_id: "acme".to_owned(),
-            agent_id: "research-agent".to_owned(),
-            roles: vec!["researcher".to_owned()],
-            token_ref: Some("tok-p10".to_owned()),
-        }],
+        principals: vec![
+            PrincipalConfig {
+                org_id: "acme".to_owned(),
+                agent_id: "research-agent".to_owned(),
+                roles: vec!["researcher".to_owned()],
+                token_ref: Some("tok-p10".to_owned()),
+            },
+            PrincipalConfig {
+                org_id: "acme".to_owned(),
+                agent_id: "approver-human".to_owned(),
+                roles: vec!["p10-approver".to_owned()],
+                token_ref: Some("tok-approver".to_owned()),
+            },
+            PrincipalConfig {
+                org_id: "other".to_owned(),
+                agent_id: "other-approver".to_owned(),
+                roles: vec!["p10-approver".to_owned()],
+                token_ref: Some("tok-other-org".to_owned()),
+            },
+        ],
         servers: vec![ServerConfig {
             alias: "database".to_owned(),
             timeout_ms: 5_000,
@@ -1036,12 +1050,21 @@ permit(
             .await
     });
 
-    // Poll /p10/pending until the gate appears, then approve it
+    // Non-approver agent cannot list /p10/pending (403 Forbidden)
+    let forbidden_pend = client
+        .get(format!("{base}/p10/pending"))
+        .header("authorization", "Bearer tok-p10")
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(forbidden_pend.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Poll /p10/pending as p10-approver until the gate appears
     let mut approval_id = None;
     for _ in 0..40 {
         let pend: Value = client
             .get(format!("{base}/p10/pending"))
-            .header("authorization", "Bearer tok-p10")
+            .header("authorization", "Bearer tok-approver")
             .send()
             .await
             .map_err(|e| KeelwayError::Mcp(e.to_string()))?
@@ -1057,9 +1080,28 @@ permit(
     let gate_id =
         approval_id.ok_or_else(|| KeelwayError::Mcp("P-10 gate never appeared".to_owned()))?;
 
-    let resolve_resp = client
+    // Self-approval (no p10-approver role) and cross-tenant approval both fail with 403 Forbidden
+    let self_resolve = client
         .post(format!("{base}/p10/resolve"))
         .header("authorization", "Bearer tok-p10")
+        .json(&json!({ "approval_id": gate_id, "approved": true }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(self_resolve.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let cross_org_resolve = client
+        .post(format!("{base}/p10/resolve"))
+        .header("authorization", "Bearer tok-other-org")
+        .json(&json!({ "approval_id": gate_id, "approved": true }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(cross_org_resolve.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let resolve_resp = client
+        .post(format!("{base}/p10/resolve"))
+        .header("authorization", "Bearer tok-approver")
         .json(&json!({ "approval_id": gate_id, "approved": true }))
         .send()
         .await

@@ -7,6 +7,19 @@ use tokio::sync::broadcast;
 
 const CONSOLE_BROADCAST_CAPACITY: usize = 256;
 
+/// Explicit outcome classification for a mediated tool call event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventOutcome {
+    Allowed,
+    DeniedPolicy,
+    DeniedAuth,
+    DeniedBudget,
+    P10Awaiting,
+    P10Approved,
+    P10Denied,
+}
+
 /// Real-time event emitted for each mediated tool call and streamed to SSE console subscribers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveConsoleEvent {
@@ -17,6 +30,7 @@ pub struct LiveConsoleEvent {
     pub tool: String,
     pub decision: Decision,
     pub state: ReceiptState,
+    pub outcome: EventOutcome,
     pub reason: String,
 }
 
@@ -184,32 +198,14 @@ impl GatewayMetrics {
     }
 
     fn update_counters_for_event(&self, event: &LiveConsoleEvent) {
-        let reason_lower = event.reason.to_ascii_lowercase();
-        match (event.decision, event.state) {
-            (Decision::Allow, ReceiptState::Sealed) => {
-                if reason_lower.contains("p10") {
-                    self.inc_calls_p10_approved();
-                } else {
-                    self.inc_calls_allowed();
-                }
-            }
-            (_, ReceiptState::Awaiting) => {
-                self.inc_p10_pending();
-            }
-            (Decision::Deny, _) | (_, ReceiptState::Blocked) => {
-                if reason_lower.contains("budget") {
-                    self.inc_calls_denied_budget();
-                } else if reason_lower.contains("auth")
-                    || reason_lower.contains("principal")
-                    || reason_lower.contains("unauthorized")
-                {
-                    self.inc_calls_denied_auth();
-                } else if reason_lower.contains("p10") || reason_lower.contains("approval") {
-                    self.inc_calls_p10_denied();
-                } else {
-                    self.inc_calls_denied_policy();
-                }
-            }
+        match event.outcome {
+            EventOutcome::Allowed => self.inc_calls_allowed(),
+            EventOutcome::DeniedPolicy => self.inc_calls_denied_policy(),
+            EventOutcome::DeniedAuth => self.inc_calls_denied_auth(),
+            EventOutcome::DeniedBudget => self.inc_calls_denied_budget(),
+            EventOutcome::P10Awaiting => self.inc_p10_pending(),
+            EventOutcome::P10Approved => self.inc_calls_p10_approved(),
+            EventOutcome::P10Denied => self.inc_calls_p10_denied(),
         }
     }
 }
@@ -218,7 +214,12 @@ impl GatewayMetrics {
 mod tests {
     use super::*;
 
-    fn sample_event(decision: Decision, state: ReceiptState, reason: &str) -> LiveConsoleEvent {
+    fn sample_event(
+        decision: Decision,
+        state: ReceiptState,
+        outcome: EventOutcome,
+        reason: &str,
+    ) -> LiveConsoleEvent {
         LiveConsoleEvent {
             timestamp: Utc::now(),
             org_id: "org-1".to_owned(),
@@ -227,6 +228,7 @@ mod tests {
             tool: "create_issue".to_owned(),
             decision,
             state,
+            outcome,
             reason: reason.to_owned(),
         }
     }
@@ -238,36 +240,43 @@ mod tests {
         metrics.record_event(sample_event(
             Decision::Allow,
             ReceiptState::Sealed,
+            EventOutcome::Allowed,
             "allowed by policy",
         ));
         metrics.record_event(sample_event(
             Decision::Deny,
             ReceiptState::Blocked,
+            EventOutcome::DeniedPolicy,
             "forbidden by cedar policy",
         ));
         metrics.record_event(sample_event(
             Decision::Deny,
             ReceiptState::Blocked,
+            EventOutcome::DeniedAuth,
             "authentication failed: unknown principal",
         ));
         metrics.record_event(sample_event(
             Decision::Deny,
             ReceiptState::Blocked,
+            EventOutcome::DeniedBudget,
             "execution budget exceeded",
         ));
         metrics.record_event(sample_event(
             Decision::Allow,
             ReceiptState::Sealed,
+            EventOutcome::P10Approved,
             "p10 human approval granted",
         ));
         metrics.record_event(sample_event(
             Decision::Deny,
             ReceiptState::Blocked,
+            EventOutcome::P10Denied,
             "p10 approval rejected",
         ));
         metrics.record_event(sample_event(
             Decision::Allow,
             ReceiptState::Awaiting,
+            EventOutcome::P10Awaiting,
             "awaiting p10 approval",
         ));
         metrics.inc_upstream_timeout();
@@ -334,13 +343,19 @@ keelway_p10_pending 1
         metrics.record_event(sample_event(
             Decision::Allow,
             ReceiptState::Sealed,
+            EventOutcome::Allowed,
             "no subscribers yet",
         ));
 
         let mut rx1 = metrics.subscribe();
         let mut rx2 = metrics.subscribe();
 
-        let event = sample_event(Decision::Deny, ReceiptState::Blocked, "policy deny");
+        let event = sample_event(
+            Decision::Deny,
+            ReceiptState::Blocked,
+            EventOutcome::DeniedPolicy,
+            "policy deny",
+        );
         metrics.record_event(event.clone());
 
         let recv1 = rx1.recv().await;
