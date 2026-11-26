@@ -402,6 +402,11 @@ impl GatewayEngine {
     }
 
     fn resolve_tape_path(&self) -> PathBuf {
+        if let Ok(env_path) = std::env::var("KEELWAY_TAPE_PATH")
+            && !env_path.trim().is_empty()
+        {
+            return PathBuf::from(env_path);
+        }
         if self.config.tape_path.is_absolute() {
             self.config.tape_path.clone()
         } else {

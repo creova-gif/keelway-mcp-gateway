@@ -6,6 +6,8 @@ metadata:
     app.kubernetes.io/name: keelway-gateway
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: keelway-gateway
@@ -17,6 +19,9 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -35,6 +40,8 @@ spec:
           env:
             - name: KEELWAY_BIND_ADDR
               value: "0.0.0.0:8080"
+            - name: KEELWAY_TAPE_PATH
+              value: "/var/lib/keelway/keelway-tape.jsonl"
           securityContext:
             runAsNonRoot: true
             readOnlyRootFilesystem: true
