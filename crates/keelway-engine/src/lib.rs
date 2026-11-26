@@ -2,6 +2,7 @@ pub mod auth;
 pub(crate) mod budget;
 pub mod circuit;
 pub mod core;
+pub(crate) mod http;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
 pub(crate) mod p10;
@@ -12,7 +13,8 @@ pub(crate) mod tape;
 mod upstream;
 
 use crate::core::{GatewayConfig, KeelwayError, PolicyDecision, Principal, ToolCall};
-use crate::mcp::{GatewayRuntime, build_http_router, serve_stdio_loop};
+use crate::http::build_http_router;
+use crate::mcp::{GatewayRuntime, serve_stdio_loop};
 use crate::policy::PolicyEngine;
 use crate::secrets::DefaultSecretProvider;
 use crate::tape::{ReplayEntry, TapeVerification, TapeWriter};
@@ -247,11 +249,12 @@ impl GatewayEngine {
         )?);
         let app = build_http_router(runtime.clone());
         self.spawn_hot_reload_watcher();
-        let listener = tokio::net::TcpListener::bind(&self.config.bind_addr).await?;
-        tracing::info!(
-            "keelway MCP gateway listening on http://{}/mcp",
-            self.config.bind_addr
-        );
+        let bind_addr = std::env::var("KEELWAY_BIND_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.config.bind_addr.clone());
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        tracing::info!("keelway MCP gateway listening on http://{bind_addr}/mcp");
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal(runtime))
             .await

@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.agents/
+.gstack/
+*.jsonl
+**/*.rs.bk
+.env
+.env.*
+.DS_Store
+docs/
+benchmarks/
+examples/

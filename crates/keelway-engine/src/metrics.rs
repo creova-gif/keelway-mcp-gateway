@@ -45,6 +45,7 @@ pub struct GatewayMetrics {
     pub upstream_timeouts: AtomicU64,
     pub upstream_errors: AtomicU64,
     pub p10_pending: AtomicU64,
+    pub circuits_open: AtomicU64,
     console_tx: broadcast::Sender<LiveConsoleEvent>,
 }
 
@@ -68,6 +69,7 @@ impl GatewayMetrics {
             upstream_timeouts: AtomicU64::new(0),
             upstream_errors: AtomicU64::new(0),
             p10_pending: AtomicU64::new(0),
+            circuits_open: AtomicU64::new(0),
             console_tx,
         }
     }
@@ -134,6 +136,11 @@ impl GatewayMetrics {
         self.p10_pending.store(count, Ordering::Relaxed);
     }
 
+    /// Sets `circuits_open` to an exact count.
+    pub fn set_circuits_open(&self, count: u64) {
+        self.circuits_open.store(count, Ordering::Relaxed);
+    }
+
     /// Renders all metrics in Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let allowed = self.calls_allowed.load(Ordering::Relaxed);
@@ -145,6 +152,7 @@ impl GatewayMetrics {
         let timeouts = self.upstream_timeouts.load(Ordering::Relaxed);
         let errors = self.upstream_errors.load(Ordering::Relaxed);
         let pending = self.p10_pending.load(Ordering::Relaxed);
+        let circuits_open = self.circuits_open.load(Ordering::Relaxed);
 
         let mut out = String::with_capacity(640);
         let _ = writeln!(
@@ -194,6 +202,13 @@ impl GatewayMetrics {
         );
         let _ = writeln!(out, "# TYPE keelway_p10_pending gauge");
         let _ = writeln!(out, "keelway_p10_pending {pending}");
+
+        let _ = writeln!(
+            out,
+            "# HELP keelway_circuits_open Number of upstream circuit breakers currently in open state."
+        );
+        let _ = writeln!(out, "# TYPE keelway_circuits_open gauge");
+        let _ = writeln!(out, "keelway_circuits_open {circuits_open}");
         out
     }
 
@@ -296,6 +311,11 @@ mod tests {
         assert_eq!(metrics.p10_pending.load(Ordering::Relaxed), 3);
         metrics.set_p10_pending(0);
         assert_eq!(metrics.p10_pending.load(Ordering::Relaxed), 0);
+
+        metrics.set_circuits_open(2);
+        assert_eq!(metrics.circuits_open.load(Ordering::Relaxed), 2);
+        metrics.set_circuits_open(0);
+        assert_eq!(metrics.circuits_open.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -312,6 +332,7 @@ mod tests {
         metrics.inc_upstream_error();
         metrics.inc_upstream_error();
         metrics.inc_p10_pending();
+        metrics.set_circuits_open(1);
 
         let rendered = metrics.render_prometheus();
 
@@ -331,6 +352,9 @@ keelway_upstream_errors_total{kind=\"error\"} 2
 # HELP keelway_p10_pending Number of tool calls currently awaiting P10 human approval.
 # TYPE keelway_p10_pending gauge
 keelway_p10_pending 1
+# HELP keelway_circuits_open Number of upstream circuit breakers currently in open state.
+# TYPE keelway_circuits_open gauge
+keelway_circuits_open 1
 ";
         assert_eq!(rendered, expected);
     }
