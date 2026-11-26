@@ -1,9 +1,10 @@
 use crate::auth::JwtVerifier;
 use crate::budget::BudgetTracker;
+use crate::circuit::{CircuitBreaker, CircuitState};
 use crate::core::{
     Decision, ExecutionOutcome, Explanation, GatewayConfig, KeelwayError, Principal, PromptConfig,
-    ReceiptState, ResourceConfig, ServerConfig, ToolCall, UnsealedReceipt, UpstreamTransport,
-    sanitize_federated_name, validate_server_alias,
+    ReceiptState, ResourceConfig, ToolCall, UnsealedReceipt, sanitize_federated_name,
+    validate_server_alias,
 };
 use crate::metrics::{EventOutcome, GatewayMetrics, LiveConsoleEvent};
 use crate::p10::P10GateManager;
@@ -11,6 +12,7 @@ use crate::policy::PolicyEngine;
 use crate::provenance::extract_or_generate_trace_id;
 use crate::secrets::{SecretProvider, SecretScrubber};
 use crate::tape::TapeWriter;
+use crate::upstream::UpstreamDriver;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -18,17 +20,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
 
 pub const JSONRPC_POLICY_DENIED: i64 = -32000;
 pub const JSONRPC_TAPE_PERSISTENCE_ERR: i64 = -32001;
@@ -86,312 +84,6 @@ impl ToolRegistry {
     }
 }
 
-/// Live stdio child process handle with bounded exponential-backoff restart.
-struct StdioProcess {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-enum UpstreamDriver {
-    Stdio {
-        command: String,
-        args: Vec<String>,
-        resolved_env: BTreeMap<String, String>,
-        timeout_ms: u64,
-        process: Box<Mutex<Option<StdioProcess>>>,
-    },
-    StreamableHttp {
-        url: String,
-        resolved_headers: BTreeMap<String, String>,
-        timeout_ms: u64,
-        client: reqwest::Client,
-    },
-}
-
-impl UpstreamDriver {
-    fn from_server_config(
-        server: &ServerConfig,
-        secrets: &dyn SecretProvider,
-        collected_secrets: &mut Vec<String>,
-    ) -> Result<Self, KeelwayError> {
-        match &server.transport {
-            UpstreamTransport::Stdio { command, args, env } => {
-                let mut resolved_env = BTreeMap::new();
-                for (k, v) in env {
-                    let val = secrets.resolve(v)?;
-                    if v.starts_with("secret://") {
-                        collected_secrets.push(val.clone());
-                    }
-                    resolved_env.insert(k.clone(), val);
-                }
-                Ok(Self::Stdio {
-                    command: command.clone(),
-                    args: args.clone(),
-                    resolved_env,
-                    timeout_ms: server.timeout_ms,
-                    process: Box::new(Mutex::new(None)),
-                })
-            }
-            UpstreamTransport::StreamableHttp { url, headers } => {
-                let mut resolved_headers = BTreeMap::new();
-                for (k, v) in headers {
-                    let val = secrets.resolve(v)?;
-                    if v.starts_with("secret://") {
-                        collected_secrets.push(val.clone());
-                    }
-                    resolved_headers.insert(k.clone(), val);
-                }
-                let client = reqwest::Client::builder()
-                    .timeout(Duration::from_millis(server.timeout_ms))
-                    .build()
-                    .map_err(|e| KeelwayError::Mcp(format!("http client build failed: {e}")))?;
-                Ok(Self::StreamableHttp {
-                    url: url.clone(),
-                    resolved_headers,
-                    timeout_ms: server.timeout_ms,
-                    client,
-                })
-            }
-        }
-    }
-
-    async fn call_tool(
-        &self,
-        upstream_tool: &str,
-        arguments: &Value,
-        scrubber: &Arc<SecretScrubber>,
-        max_response_bytes: usize,
-        trace_id: Option<&str>,
-    ) -> Result<Value, KeelwayError> {
-        self.call_method(
-            "tools/call",
-            json!({
-                "name": upstream_tool,
-                "arguments": arguments,
-            }),
-            scrubber,
-            max_response_bytes,
-            trace_id,
-        )
-        .await
-    }
-
-    async fn call_method(
-        &self,
-        method: &str,
-        params: Value,
-        scrubber: &Arc<SecretScrubber>,
-        max_response_bytes: usize,
-        trace_id: Option<&str>,
-    ) -> Result<Value, KeelwayError> {
-        let req_id = uuid::Uuid::new_v4().to_string();
-        let rpc_body = json!({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "method": method,
-            "params": params,
-        });
-
-        match self {
-            Self::Stdio {
-                command,
-                args,
-                resolved_env,
-                timeout_ms,
-                process,
-            } => {
-                let mut guard = process.lock().await;
-                if guard.is_none() {
-                    let spawned = spawn_stdio_child(command, args, resolved_env, scrubber.clone())?;
-                    *guard = Some(spawned);
-                }
-                let fut = async {
-                    let Some(proc_handle) = guard.as_mut() else {
-                        return Err(KeelwayError::UpstreamUnavailable(
-                            "stdio child unavailable".to_owned(),
-                        ));
-                    };
-                    let mut line = serde_json::to_string(&rpc_body)?;
-                    line.push('\n');
-                    proc_handle
-                        .stdin
-                        .write_all(line.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            KeelwayError::UpstreamUnavailable(format!("stdio write: {e}"))
-                        })?;
-                    proc_handle.stdin.flush().await.map_err(|e| {
-                        KeelwayError::UpstreamUnavailable(format!("stdio flush: {e}"))
-                    })?;
-
-                    let mut resp_line = String::new();
-                    let n = proc_handle
-                        .stdout
-                        .read_line(&mut resp_line)
-                        .await
-                        .map_err(|e| {
-                            KeelwayError::UpstreamUnavailable(format!("stdio read: {e}"))
-                        })?;
-                    if n == 0 {
-                        return Err(KeelwayError::UpstreamUnavailable(
-                            "stdio child exited unexpectedly (EOF)".to_owned(),
-                        ));
-                    }
-                    if resp_line.len() > max_response_bytes {
-                        return Err(KeelwayError::Mcp(format!(
-                            "PayloadTooLarge: upstream response ({} bytes) exceed max_response_bytes ({max_response_bytes})",
-                            resp_line.len()
-                        )));
-                    }
-                    let scrubbed = scrubber.scrub_str(&resp_line);
-                    let parsed: Value = serde_json::from_str(&scrubbed)?;
-                    if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
-                        return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
-                    }
-                    Ok(parsed.get("result").cloned().unwrap_or(parsed))
-                };
-
-                match tokio::time::timeout(Duration::from_millis(*timeout_ms), fut).await {
-                    Ok(Ok(val)) => Ok(val),
-                    Ok(Err(e)) => {
-                        // Drop crashed handle so next request triggers bounded restart
-                        if let Some(mut dead) = guard.take() {
-                            let _ = dead.child.kill().await;
-                        }
-                        Err(e)
-                    }
-                    Err(_) => {
-                        if let Some(mut hung) = guard.take() {
-                            let _ = hung.child.kill().await;
-                        }
-                        Err(KeelwayError::UpstreamTimeout(*timeout_ms))
-                    }
-                }
-            }
-            Self::StreamableHttp {
-                url,
-                resolved_headers,
-                timeout_ms,
-                client,
-            } => {
-                let mut req = client.post(url).json(&rpc_body);
-                if let Some(tid) = trace_id {
-                    let span_id = &uuid::Uuid::new_v4().simple().to_string()[..16];
-                    req = req.header("traceparent", format!("00-{tid}-{span_id}-01"));
-                }
-                for (k, v) in resolved_headers {
-                    req = req.header(k, v);
-                }
-                let resp = match tokio::time::timeout(
-                    Duration::from_millis(*timeout_ms),
-                    req.send(),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        return Err(KeelwayError::UpstreamUnavailable(format!(
-                            "upstream HTTP error: {e}"
-                        )));
-                    }
-                    Err(_) => return Err(KeelwayError::UpstreamTimeout(*timeout_ms)),
-                };
-
-                if !resp.status().is_success() {
-                    return Err(KeelwayError::UpstreamUnavailable(format!(
-                        "upstream returned HTTP {}",
-                        resp.status()
-                    )));
-                }
-
-                // Stream body through sliding-window Aho-Corasick scrubber to catch SSE chunk-straddling secrets
-                let mut streaming_scrubber = scrubber.streaming();
-                let mut byte_stream = resp.bytes_stream();
-                let mut assembled = String::new();
-                let mut total_bytes = 0usize;
-                while let Some(chunk_res) = byte_stream.next().await {
-                    let chunk = chunk_res.map_err(|e| {
-                        KeelwayError::UpstreamUnavailable(format!("stream read error: {e}"))
-                    })?;
-                    total_bytes = total_bytes.saturating_add(chunk.len());
-                    if total_bytes > max_response_bytes {
-                        return Err(KeelwayError::Mcp(format!(
-                            "PayloadTooLarge: upstream response ({total_bytes} bytes) exceed max_response_bytes ({max_response_bytes})"
-                        )));
-                    }
-                    let chunk_str = String::from_utf8_lossy(&chunk);
-                    assembled.push_str(&streaming_scrubber.push_chunk(&chunk_str));
-                }
-                assembled.push_str(&streaming_scrubber.finish());
-
-                let parsed: Value = serde_json::from_str(&assembled).unwrap_or_else(
-                    |_| json!({ "content": [{ "type": "text", "text": assembled }] }),
-                );
-                if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
-                    return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
-                }
-                Ok(parsed.get("result").cloned().unwrap_or(parsed))
-            }
-        }
-    }
-}
-
-fn spawn_stdio_child(
-    command: &str,
-    args: &[String],
-    resolved_env: &BTreeMap<String, String>,
-    scrubber: Arc<SecretScrubber>,
-) -> Result<StdioProcess, KeelwayError> {
-    let mut cmd = Command::new(command);
-    cmd.args(args)
-        // Clear inherited host env so operator secrets never leak to untrusted stdio children (ADR-003).
-        .env_clear();
-    for safe_key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
-        if let Ok(val) = std::env::var(safe_key) {
-            cmd.env(safe_key, val);
-        }
-    }
-    cmd.envs(resolved_env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| {
-        KeelwayError::UpstreamUnavailable(format!("failed to spawn stdio server '{command}': {e}"))
-    })?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| KeelwayError::UpstreamUnavailable("missing child stdin".to_owned()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| KeelwayError::UpstreamUnavailable("missing child stdout".to_owned()))?;
-
-    // Capture and scrub child stderr continuously so secrets never leak to operator logs
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            while let Ok(n) = reader.read_line(&mut line).await {
-                if n == 0 {
-                    break;
-                }
-                let scrubbed = scrubber.scrub_str(line.trim_end());
-                tracing::warn!(target: "keelway_upstream_stderr", "{}", scrubbed);
-                line.clear();
-            }
-        });
-    }
-
-    Ok(StdioProcess {
-        child,
-        stdin,
-        stdout: BufReader::new(stdout),
-    })
-}
-
 /// Shared runtime state for the MCP Gateway.
 pub struct GatewayRuntime {
     pub policy: Arc<PolicyEngine>,
@@ -400,7 +92,9 @@ pub struct GatewayRuntime {
     pub registry: ToolRegistry,
     budgets: BudgetTracker,
     p10: P10GateManager,
+    circuit_breaker: CircuitBreaker,
     metrics: Arc<GatewayMetrics>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     token_map: HashMap<String, Principal>,
     jwt_verifier: Option<JwtVerifier>,
     upstreams: HashMap<String, UpstreamDriver>,
@@ -482,7 +176,9 @@ impl GatewayRuntime {
         );
         let budgets = BudgetTracker::new(config.budgets.clone());
         let p10 = P10GateManager::new(config.approval_required.clone());
+        let circuit_breaker = CircuitBreaker::default();
         let metrics = Arc::new(GatewayMetrics::new());
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 
         Ok(Self {
             policy,
@@ -491,7 +187,9 @@ impl GatewayRuntime {
             registry,
             budgets,
             p10,
+            circuit_breaker,
             metrics,
+            shutdown_tx,
             token_map,
             jwt_verifier,
             upstreams,
@@ -501,6 +199,11 @@ impl GatewayRuntime {
             max_request_bytes: config.max_request_bytes,
             max_response_bytes: config.max_response_bytes,
         })
+    }
+
+    /// Signals all long-lived streaming handlers (such as `/events` SSE) to terminate cleanly.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     pub fn authenticate_bearer(&self, auth_header: Option<&str>) -> Option<Principal> {
@@ -1083,6 +786,27 @@ impl GatewayRuntime {
                     );
                 };
 
+                let permit = match self.circuit_breaker.before_call(&tool_meta.server_alias) {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        self.metrics.inc_upstream_error();
+                        let _ = self
+                            .record_outcome(
+                                principal,
+                                tool_meta,
+                                &eval.explanation,
+                                ExecutionOutcome::Crashed,
+                            )
+                            .await;
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_UPSTREAM_UNAVAILABLE,
+                            &format!("UpstreamUnavailable: {e}"),
+                            None,
+                        );
+                    }
+                };
+
                 match upstream
                     .call_tool(
                         &tool_meta.upstream_name,
@@ -1094,6 +818,7 @@ impl GatewayRuntime {
                     .await
                 {
                     Ok(result) => {
+                        permit.record_success();
                         let resp_bytes = serde_json::to_vec(&result)
                             .map(|v| v.len())
                             .unwrap_or(usize::MAX);
@@ -1135,6 +860,7 @@ impl GatewayRuntime {
                         })
                     }
                     Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
+                        permit.release();
                         let _ = self
                             .tape
                             .append(UnsealedReceipt {
@@ -1162,6 +888,7 @@ impl GatewayRuntime {
                         jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
                     }
                     Err(KeelwayError::UpstreamTimeout(ms)) => {
+                        permit.record_failure();
                         self.metrics.inc_upstream_timeout();
                         let _ = self
                             .record_outcome(
@@ -1179,6 +906,11 @@ impl GatewayRuntime {
                         )
                     }
                     Err(e) => {
+                        if matches!(e, KeelwayError::UpstreamUnavailable(_)) {
+                            permit.record_failure();
+                        } else {
+                            permit.release();
+                        }
                         self.metrics.inc_upstream_error();
                         let _ = self
                             .record_outcome(
@@ -1567,6 +1299,19 @@ impl GatewayRuntime {
             &scrubbed_explanation.reason,
         );
 
+        let permit = match self.circuit_breaker.before_call(server) {
+            Ok(permit) => permit,
+            Err(e) => {
+                self.metrics.inc_upstream_error();
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_UPSTREAM_UNAVAILABLE,
+                    &format!("UpstreamUnavailable: {e}"),
+                    None,
+                );
+            }
+        };
+
         match upstream
             .call_method(
                 rpc_method,
@@ -1578,6 +1323,7 @@ impl GatewayRuntime {
             .await
         {
             Ok(result) => {
+                permit.record_success();
                 let resp_bytes = serde_json::to_vec(&result)
                     .map(|v| v.len())
                     .unwrap_or(usize::MAX);
@@ -1627,6 +1373,7 @@ impl GatewayRuntime {
                 })
             }
             Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
+                permit.release();
                 if let Err(e) = self
                     .tape
                     .append(UnsealedReceipt {
@@ -1662,6 +1409,7 @@ impl GatewayRuntime {
                 jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
             }
             Err(KeelwayError::UpstreamTimeout(ms)) => {
+                permit.record_failure();
                 self.metrics.inc_upstream_timeout();
                 jsonrpc_error(
                     id,
@@ -1671,6 +1419,11 @@ impl GatewayRuntime {
                 )
             }
             Err(e) => {
+                if matches!(e, KeelwayError::UpstreamUnavailable(_)) {
+                    permit.record_failure();
+                } else {
+                    permit.release();
+                }
                 self.metrics.inc_upstream_error();
                 jsonrpc_error(
                     id,
@@ -1750,6 +1503,7 @@ pub fn build_http_router(runtime: Arc<GatewayRuntime>) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .route("/ui", get(ui_console_handler))
         .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler))
         .route("/metrics", get(metrics_handler))
         .route("/events", get(events_sse_handler))
         .route("/p10/pending", get(p10_pending_handler))
@@ -1782,6 +1536,28 @@ async fn ui_console_handler() -> Response {
 
 async fn healthz_handler() -> Response {
     (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+}
+
+async fn readyz_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response {
+    let snapshot = runtime.circuit_breaker.snapshot();
+    let open_count = snapshot
+        .iter()
+        .filter(|(_, state)| *state == CircuitState::Open)
+        .count();
+    let any_open = open_count > 0;
+    let status = if any_open {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(json!({
+            "ready": !any_open,
+            "open_circuits": open_count,
+        })),
+    )
+        .into_response()
 }
 
 async fn metrics_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response {
@@ -1822,51 +1598,65 @@ async fn events_sse_handler(
     }
     let org_id = principal.org_id.clone();
     let rx_owned = runtime.metrics.subscribe();
+    let shutdown_rx = runtime.shutdown_tx.subscribe();
     let sse_stream = futures_util::stream::unfold(
-        (rx_owned, org_id, exp),
-        |(mut rx, org_id, exp)| async move {
+        (rx_owned, shutdown_rx, org_id, exp),
+        |(mut rx, mut shutdown_rx, org_id, exp)| async move {
             loop {
+                if *shutdown_rx.borrow() {
+                    return None;
+                }
                 if let Some(exp_ts) = exp {
                     let now = Utc::now().timestamp().max(0) as u64;
                     if now >= exp_ts {
                         return None;
                     }
                     let remaining = std::time::Duration::from_secs(exp_ts - now);
-                    match tokio::time::timeout(remaining, rx.recv()).await {
-                        Ok(Ok(ev)) => {
-                            if ev.org_id != org_id {
-                                continue;
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return None,
+                        res = tokio::time::timeout(remaining, rx.recv()) => {
+                            match res {
+                                Ok(Ok(ev)) => {
+                                    if ev.org_id != org_id {
+                                        continue;
+                                    }
+                                    let payload =
+                                        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                                    return Some((
+                                        Ok::<Event, std::convert::Infallible>(
+                                            Event::default().data(payload),
+                                        ),
+                                        (rx, shutdown_rx, org_id, exp),
+                                    ));
+                                }
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                                Err(_) => return None,
                             }
-                            let payload =
-                                serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
-                            return Some((
-                                Ok::<Event, std::convert::Infallible>(
-                                    Event::default().data(payload),
-                                ),
-                                (rx, org_id, exp),
-                            ));
                         }
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
-                        Err(_) => return None,
                     }
                 } else {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            if ev.org_id != org_id {
-                                continue;
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return None,
+                        res = rx.recv() => {
+                            match res {
+                                Ok(ev) => {
+                                    if ev.org_id != org_id {
+                                        continue;
+                                    }
+                                    let payload =
+                                        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                                    return Some((
+                                        Ok::<Event, std::convert::Infallible>(
+                                            Event::default().data(payload),
+                                        ),
+                                        (rx, shutdown_rx, org_id, exp),
+                                    ));
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                             }
-                            let payload =
-                                serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
-                            return Some((
-                                Ok::<Event, std::convert::Infallible>(
-                                    Event::default().data(payload),
-                                ),
-                                (rx, org_id, exp),
-                            ));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
             }

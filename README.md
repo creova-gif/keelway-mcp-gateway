@@ -32,7 +32,7 @@ Keelway is a single-binary, fail-closed Rust execution gateway and offline polic
 - **P-10 Human Approval Gates:** Matching `approval_required` rules hold authorized calls in `AWAITING` state on an in-memory `oneshot` gate until resolved via `GET /p10/pending` and authenticated `POST /p10/resolve` (failing closed with `-32005 ApprovalDenied` on deny or timeout).
 - **OS-Thread SHA-256 Tape & Ed25519 Provenance:** A dedicated OS thread batches and `sync_data()`-flushes hash-chained (`prev_hash` / `entry_hash`) JSONL receipts to `keelway-tape.jsonl`, failing closed (`-32001`) if persistence fails, verifying the full chain in O(1) memory on startup, and optionally signing receipts with Ed25519 (`signing_key_ref`) alongside W3C `traceparent` correlation.
 - **Payload Limits & Secret Scrubber:** Enforces configurable `max_request_bytes` / `max_response_bytes` bounds (`-32006 PayloadTooLarge`), resolves `secret://env/...` and `secret://file/...` strictly inside the gateway, and redacts registered secrets (`>= 8` bytes across raw, JSON-escaped, URL-encoded, and Base64 forms) plus built-in AWS, GitHub, and PEM credential patterns via Aho-Corasick across responses, SSE chunk boundaries, `stderr`, console logs, and receipts.
-- **Real-Time Observability & Operator Console:** Exposes `GET /healthz`, `GET /metrics` (Prometheus text format), `GET /events` (live SSE stream of gateway decisions and `AWAITING` gate events), and `GET /ui` (zero-dependency embedded Operator Console).
+- **Real-Time Observability & Operator Console:** Exposes `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus text format), `GET /events` (live SSE stream of gateway decisions and `AWAITING` gate events), and `GET /ui` (zero-dependency embedded Operator Console).
 
 ## Installation
 
@@ -84,7 +84,7 @@ Additional lifecycle commands:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `bind_addr` | `string` | `"127.0.0.1:8080"` | TCP address and port for the HTTP gateway, `/metrics`, `/events`, `/p10/*`, and `/ui`. |
+| `bind_addr` | `string` | `"127.0.0.1:8080"` | TCP address and port for the HTTP gateway, `/healthz`, `/readyz`, `/metrics`, `/events`, `/p10/*`, and `/ui`. |
 | `tape_path` | `path` | `"keelway-tape.jsonl"` | Output path for the SHA-256 hash-chained JSONL execution tape. |
 | `policy_files` | `list<path>` | `[]` | Cedar policy files (`.cedar`) loaded at startup and hot-reloaded on `SIGHUP` or `mtime` change. |
 | `principals` | `list<object>` | `[]` | Authenticated principals (`org_id`, `agent_id`, `roles`, and `token_ref` / `secret://` binding). |
@@ -96,6 +96,7 @@ Additional lifecycle commands:
 | `max_response_bytes` | `integer` | `4194304` | Maximum upstream response size in bytes (`-32006 PayloadTooLarge` if exceeded). |
 | `egress_pattern_scrubbing` | `bool` | `true` | Enables built-in Aho-Corasick/pattern scrubbing for unregistered AWS, GitHub, and PEM credentials. |
 | `signing_key_ref` | `string?` | `null` | Optional `secret://` reference to a 32-byte Ed25519 seed for signing audit tape receipts. |
+| `jwt_auth` | `object?` | `null` | Optional `JwtConfig` for stateless JWT/OIDC bearer authentication (`issuer`, `audience`, `hs256_secret`, `ed25519_public_key_hex`, `jwks_url`, claim mappings). |
 
 ## Benchmarks
 
