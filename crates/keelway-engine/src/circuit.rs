@@ -1,7 +1,7 @@
 use crate::core::KeelwayError;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
@@ -32,12 +32,66 @@ impl InternalState {
     }
 }
 
-/// Per-server bounded circuit breaker protecting gateway capacity when upstreams degrade.
+#[derive(Debug, Clone, Copy)]
+struct ServerCircuit {
+    state: InternalState,
+    generation: u64,
+}
+
 #[derive(Debug)]
-pub struct CircuitBreaker {
+struct CircuitBreakerInner {
     failure_threshold: u32,
     cooldown: Duration,
-    servers: Mutex<BTreeMap<String, InternalState>>,
+    servers: Mutex<BTreeMap<String, ServerCircuit>>,
+}
+
+/// Per-server bounded circuit breaker protecting gateway capacity when upstreams degrade.
+#[derive(Debug, Clone)]
+pub struct CircuitBreaker {
+    inner: Arc<CircuitBreakerInner>,
+}
+
+/// RAII permit for an in-flight upstream call governed by [`CircuitBreaker`].
+///
+/// Captures the circuit `generation` at dispatch time so stale pre-trip completions cannot
+/// corrupt a newly opened circuit, and releases an active `HalfOpen` probe slot on drop.
+#[derive(Debug)]
+pub struct CircuitPermit {
+    breaker: CircuitBreaker,
+    server: String,
+    generation: u64,
+    active: bool,
+}
+
+impl CircuitPermit {
+    /// Records a successful call for the captured generation, closing the circuit if applicable.
+    pub fn record_success(mut self) {
+        self.active = false;
+        self.breaker
+            .record_success_gen(&self.server, self.generation);
+    }
+
+    /// Records a failed call for the captured generation, tripping the circuit when threshold is reached.
+    pub fn record_failure(mut self) {
+        self.active = false;
+        self.breaker
+            .record_failure_gen(&self.server, self.generation);
+    }
+
+    /// Releases the permit without recording a success or failure (e.g. non-trip errors).
+    pub fn release(mut self) {
+        self.active = false;
+        self.breaker.release_probe(&self.server, self.generation);
+    }
+}
+
+impl Drop for CircuitPermit {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            self.breaker.release_probe(&self.server, self.generation);
+        }
+    }
 }
 
 impl Default for CircuitBreaker {
@@ -50,92 +104,162 @@ impl CircuitBreaker {
     /// Creates a new circuit breaker with the given consecutive failure threshold and open cooldown.
     pub fn new(failure_threshold: u32, cooldown: Duration) -> Self {
         Self {
-            failure_threshold: failure_threshold.max(1),
-            cooldown,
-            servers: Mutex::new(BTreeMap::new()),
+            inner: Arc::new(CircuitBreakerInner {
+                failure_threshold: failure_threshold.max(1),
+                cooldown,
+                servers: Mutex::new(BTreeMap::new()),
+            }),
         }
     }
 
-    fn lock_servers(&self) -> MutexGuard<'_, BTreeMap<String, InternalState>> {
+    fn lock_servers(&self) -> MutexGuard<'_, BTreeMap<String, ServerCircuit>> {
         // Recover from lock poisoning rather than panicking in production paths.
-        self.servers
+        self.inner
+            .servers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Checks whether a call to `server` may proceed, transitioning `Open` -> `HalfOpen` after cooldown.
-    pub fn before_call(&self, server: &str) -> Result<(), KeelwayError> {
+    pub fn before_call(&self, server: &str) -> Result<CircuitPermit, KeelwayError> {
         let mut servers = self.lock_servers();
-        let Some(state) = servers.get_mut(server) else {
-            return Ok(());
+        let generation = match servers.get_mut(server) {
+            None => 0,
+            Some(entry) => match &mut entry.state {
+                InternalState::Closed { .. } => entry.generation,
+                InternalState::Open { opened_at } => {
+                    if opened_at.elapsed() >= self.inner.cooldown {
+                        entry.state = InternalState::HalfOpen {
+                            probe_in_flight: true,
+                        };
+                        entry.generation = entry.generation.wrapping_add(1);
+                        entry.generation
+                    } else {
+                        return Err(KeelwayError::UpstreamUnavailable(format!(
+                            "circuit breaker open for server '{server}'"
+                        )));
+                    }
+                }
+                InternalState::HalfOpen { probe_in_flight } => {
+                    if *probe_in_flight {
+                        return Err(KeelwayError::UpstreamUnavailable(format!(
+                            "circuit breaker half-open probe in flight for '{server}'"
+                        )));
+                    } else {
+                        *probe_in_flight = true;
+                        entry.generation
+                    }
+                }
+            },
         };
 
-        match state {
-            InternalState::Closed { .. } => Ok(()),
-            InternalState::Open { opened_at } => {
-                if opened_at.elapsed() >= self.cooldown {
-                    *state = InternalState::HalfOpen {
-                        probe_in_flight: true,
-                    };
-                    Ok(())
-                } else {
-                    Err(KeelwayError::UpstreamUnavailable(format!(
-                        "circuit breaker open for server '{server}'"
-                    )))
-                }
-            }
-            InternalState::HalfOpen { probe_in_flight } => {
-                if *probe_in_flight {
-                    Err(KeelwayError::UpstreamUnavailable(format!(
-                        "circuit breaker half-open probe in flight for '{server}'"
-                    )))
-                } else {
-                    *probe_in_flight = true;
-                    Ok(())
-                }
-            }
-        }
+        Ok(CircuitPermit {
+            breaker: self.clone(),
+            server: server.to_owned(),
+            generation,
+            active: true,
+        })
     }
 
     /// Records a successful call to `server`, resetting its circuit to `Closed`.
     pub fn record_success(&self, server: &str) {
         let mut servers = self.lock_servers();
-        servers.insert(server.to_owned(), InternalState::Closed { failures: 0 });
+        let generation = servers.get(server).map(|e| e.generation).unwrap_or(0);
+        servers.insert(
+            server.to_owned(),
+            ServerCircuit {
+                state: InternalState::Closed { failures: 0 },
+                generation,
+            },
+        );
+    }
+
+    /// Records a successful call to `server` only if `generation` matches the current circuit generation.
+    pub fn record_success_gen(&self, server: &str, generation: u64) {
+        let mut servers = self.lock_servers();
+        let Some(entry) = servers.get_mut(server) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        entry.state = InternalState::Closed { failures: 0 };
     }
 
     /// Records a failed call to `server`, tripping to `Open` when threshold is reached or a probe fails.
     pub fn record_failure(&self, server: &str) {
         let mut servers = self.lock_servers();
+        let generation = servers.get(server).map(|e| e.generation).unwrap_or(0);
+        self.record_failure_locked(&mut servers, server, generation);
+    }
+
+    /// Records a failed call to `server` only if `generation` matches the current circuit generation.
+    pub fn record_failure_gen(&self, server: &str, generation: u64) {
+        let mut servers = self.lock_servers();
+        self.record_failure_locked(&mut servers, server, generation);
+    }
+
+    fn record_failure_locked(
+        &self,
+        servers: &mut BTreeMap<String, ServerCircuit>,
+        server: &str,
+        generation: u64,
+    ) {
         match servers.get_mut(server) {
-            Some(InternalState::Closed { failures }) => {
-                *failures = failures.saturating_add(1);
-                if *failures >= self.failure_threshold {
-                    servers.insert(
-                        server.to_owned(),
-                        InternalState::Open {
+            Some(entry) => {
+                if entry.generation != generation {
+                    return;
+                }
+                match &mut entry.state {
+                    InternalState::Closed { failures } => {
+                        *failures = failures.saturating_add(1);
+                        if *failures >= self.inner.failure_threshold {
+                            entry.state = InternalState::Open {
+                                opened_at: Instant::now(),
+                            };
+                            entry.generation = entry.generation.wrapping_add(1);
+                        }
+                    }
+                    InternalState::HalfOpen { .. } | InternalState::Open { .. } => {
+                        entry.state = InternalState::Open {
                             opened_at: Instant::now(),
-                        },
-                    );
+                        };
+                        entry.generation = entry.generation.wrapping_add(1);
+                    }
                 }
             }
-            Some(InternalState::HalfOpen { .. }) | Some(InternalState::Open { .. }) => {
-                servers.insert(
-                    server.to_owned(),
-                    InternalState::Open {
-                        opened_at: Instant::now(),
-                    },
-                );
-            }
             None => {
-                let next = if self.failure_threshold <= 1 {
-                    InternalState::Open {
-                        opened_at: Instant::now(),
+                if generation != 0 {
+                    return;
+                }
+                let entry = if self.inner.failure_threshold <= 1 {
+                    ServerCircuit {
+                        state: InternalState::Open {
+                            opened_at: Instant::now(),
+                        },
+                        generation: 1,
                     }
                 } else {
-                    InternalState::Closed { failures: 1 }
+                    ServerCircuit {
+                        state: InternalState::Closed { failures: 1 },
+                        generation: 0,
+                    }
                 };
-                servers.insert(server.to_owned(), next);
+                servers.insert(server.to_owned(), entry);
             }
+        }
+    }
+
+    fn release_probe(&self, server: &str, generation: u64) {
+        let mut servers = self.lock_servers();
+        let Some(entry) = servers.get_mut(server) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        if let InternalState::HalfOpen { probe_in_flight } = &mut entry.state {
+            *probe_in_flight = false;
         }
     }
 
@@ -144,7 +268,17 @@ impl CircuitBreaker {
         let servers = self.lock_servers();
         servers
             .iter()
-            .map(|(alias, state)| (alias.clone(), state.as_public()))
+            .map(|(alias, entry)| {
+                let public_state = match entry.state {
+                    InternalState::Open { opened_at }
+                        if opened_at.elapsed() >= self.inner.cooldown =>
+                    {
+                        CircuitState::HalfOpen
+                    }
+                    other => other.as_public(),
+                };
+                (alias.clone(), public_state)
+            })
             .collect()
     }
 }
@@ -154,15 +288,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trips_after_threshold_and_fails_fast() {
+    fn trips_after_threshold_and_fails_fast() -> Result<(), KeelwayError> {
         let breaker = CircuitBreaker::new(3, Duration::from_secs(30));
 
-        assert!(breaker.before_call("alpha").is_ok());
-        breaker.record_failure("alpha");
-        assert!(breaker.before_call("alpha").is_ok());
-        breaker.record_failure("alpha");
-        assert!(breaker.before_call("alpha").is_ok());
-        breaker.record_failure("alpha");
+        breaker.before_call("alpha")?.record_failure();
+        breaker.before_call("alpha")?.record_failure();
+        breaker.before_call("alpha")?.record_failure();
 
         let err = breaker.before_call("alpha");
         assert!(matches!(err, Err(KeelwayError::UpstreamUnavailable(_))));
@@ -173,14 +304,16 @@ mod tests {
 
         // Other servers remain unaffected.
         assert!(breaker.before_call("beta").is_ok());
+        Ok(())
     }
 
     #[test]
-    fn transitions_to_half_open_after_cooldown_and_recovers_on_success() {
+    fn transitions_to_half_open_after_cooldown_and_recovers_on_success() -> Result<(), KeelwayError>
+    {
         let breaker = CircuitBreaker::new(2, Duration::from_millis(20));
 
-        breaker.record_failure("alpha");
-        breaker.record_failure("alpha");
+        breaker.before_call("alpha")?.record_failure();
+        breaker.before_call("alpha")?.record_failure();
         assert!(matches!(
             breaker.before_call("alpha"),
             Err(KeelwayError::UpstreamUnavailable(_))
@@ -188,8 +321,14 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(30));
 
+        // Snapshot reports HalfOpen after cooldown even before a probe is dispatched.
+        assert_eq!(
+            breaker.snapshot(),
+            vec![("alpha".to_owned(), CircuitState::HalfOpen)]
+        );
+
         // First call after cooldown enters HalfOpen and acquires the single probe slot.
-        assert!(breaker.before_call("alpha").is_ok());
+        let probe = breaker.before_call("alpha")?;
         assert_eq!(
             breaker.snapshot(),
             vec![("alpha".to_owned(), CircuitState::HalfOpen)]
@@ -202,19 +341,20 @@ mod tests {
         ));
 
         // Probe succeeds -> circuit closes.
-        breaker.record_success("alpha");
+        probe.record_success();
         assert_eq!(
             breaker.snapshot(),
             vec![("alpha".to_owned(), CircuitState::Closed)]
         );
         assert!(breaker.before_call("alpha").is_ok());
+        Ok(())
     }
 
     #[test]
-    fn reopens_on_half_open_probe_failure() {
+    fn reopens_on_half_open_probe_failure() -> Result<(), KeelwayError> {
         let breaker = CircuitBreaker::new(1, Duration::from_millis(15));
 
-        breaker.record_failure("alpha");
+        breaker.before_call("alpha")?.record_failure();
         assert_eq!(
             breaker.snapshot(),
             vec![("alpha".to_owned(), CircuitState::Open)]
@@ -222,13 +362,13 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(25));
 
-        assert!(breaker.before_call("alpha").is_ok());
+        let probe = breaker.before_call("alpha")?;
         assert_eq!(
             breaker.snapshot(),
             vec![("alpha".to_owned(), CircuitState::HalfOpen)]
         );
 
-        breaker.record_failure("alpha");
+        probe.record_failure();
         assert_eq!(
             breaker.snapshot(),
             vec![("alpha".to_owned(), CircuitState::Open)]
@@ -237,5 +377,57 @@ mod tests {
             breaker.before_call("alpha"),
             Err(KeelwayError::UpstreamUnavailable(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_generation_success_does_not_reset_open_circuit() -> Result<(), KeelwayError> {
+        let breaker = CircuitBreaker::new(2, Duration::from_secs(30));
+
+        let stale_permit = breaker.before_call("alpha")?;
+        breaker.before_call("alpha")?.record_failure();
+        breaker.before_call("alpha")?.record_failure();
+
+        assert_eq!(
+            breaker.snapshot(),
+            vec![("alpha".to_owned(), CircuitState::Open)]
+        );
+
+        // Stale pre-trip request completing with success must be ignored.
+        stale_permit.record_success();
+        assert_eq!(
+            breaker.snapshot(),
+            vec![("alpha".to_owned(), CircuitState::Open)]
+        );
+        assert!(matches!(
+            breaker.before_call("alpha"),
+            Err(KeelwayError::UpstreamUnavailable(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_half_open_probe_releases_probe_in_flight() -> Result<(), KeelwayError> {
+        let breaker = CircuitBreaker::new(1, Duration::from_millis(15));
+
+        breaker.before_call("alpha")?.record_failure();
+        std::thread::sleep(Duration::from_millis(25));
+
+        let probe = breaker.before_call("alpha")?;
+        assert!(matches!(
+            breaker.before_call("alpha"),
+            Err(KeelwayError::UpstreamUnavailable(_))
+        ));
+
+        // Dropping the probe (e.g. cancelled future) frees the HalfOpen slot.
+        drop(probe);
+
+        let next_probe = breaker.before_call("alpha")?;
+        next_probe.record_success();
+        assert_eq!(
+            breaker.snapshot(),
+            vec![("alpha".to_owned(), CircuitState::Closed)]
+        );
+        Ok(())
     }
 }

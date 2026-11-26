@@ -245,7 +245,7 @@ impl GatewayEngine {
             &DefaultSecretProvider,
             false,
         )?);
-        let app = build_http_router(runtime);
+        let app = build_http_router(runtime.clone());
         self.spawn_hot_reload_watcher();
         let listener = tokio::net::TcpListener::bind(&self.config.bind_addr).await?;
         tracing::info!(
@@ -253,7 +253,7 @@ impl GatewayEngine {
             self.config.bind_addr
         );
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown_signal(runtime))
             .await
             .map_err(|e| KeelwayError::Mcp(format!("http server error: {e}")))
     }
@@ -438,7 +438,7 @@ fn perform_hot_reload(
     }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(runtime: Arc<GatewayRuntime>) {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::warn!(error = %err, "failed to install Ctrl+C shutdown handler");
@@ -466,4 +466,5 @@ async fn shutdown_signal() {
         _ = ctrl_c => tracing::info!("received SIGINT (Ctrl+C); draining HTTP connections"),
         _ = terminate => tracing::info!("received SIGTERM; draining HTTP connections"),
     }
+    runtime.signal_shutdown();
 }

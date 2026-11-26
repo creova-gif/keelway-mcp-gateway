@@ -94,6 +94,7 @@ pub struct GatewayRuntime {
     p10: P10GateManager,
     circuit_breaker: CircuitBreaker,
     metrics: Arc<GatewayMetrics>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     token_map: HashMap<String, Principal>,
     jwt_verifier: Option<JwtVerifier>,
     upstreams: HashMap<String, UpstreamDriver>,
@@ -177,6 +178,7 @@ impl GatewayRuntime {
         let p10 = P10GateManager::new(config.approval_required.clone());
         let circuit_breaker = CircuitBreaker::default();
         let metrics = Arc::new(GatewayMetrics::new());
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 
         Ok(Self {
             policy,
@@ -187,6 +189,7 @@ impl GatewayRuntime {
             p10,
             circuit_breaker,
             metrics,
+            shutdown_tx,
             token_map,
             jwt_verifier,
             upstreams,
@@ -196,6 +199,11 @@ impl GatewayRuntime {
             max_request_bytes: config.max_request_bytes,
             max_response_bytes: config.max_response_bytes,
         })
+    }
+
+    /// Signals all long-lived streaming handlers (such as `/events` SSE) to terminate cleanly.
+    pub fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     pub fn authenticate_bearer(&self, auth_header: Option<&str>) -> Option<Principal> {
@@ -778,23 +786,26 @@ impl GatewayRuntime {
                     );
                 };
 
-                if let Err(e) = self.circuit_breaker.before_call(&tool_meta.server_alias) {
-                    self.metrics.inc_upstream_error();
-                    let _ = self
-                        .record_outcome(
-                            principal,
-                            tool_meta,
-                            &eval.explanation,
-                            ExecutionOutcome::Crashed,
-                        )
-                        .await;
-                    return jsonrpc_error(
-                        id,
-                        JSONRPC_UPSTREAM_UNAVAILABLE,
-                        &format!("UpstreamUnavailable: {e}"),
-                        None,
-                    );
-                }
+                let permit = match self.circuit_breaker.before_call(&tool_meta.server_alias) {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        self.metrics.inc_upstream_error();
+                        let _ = self
+                            .record_outcome(
+                                principal,
+                                tool_meta,
+                                &eval.explanation,
+                                ExecutionOutcome::Crashed,
+                            )
+                            .await;
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_UPSTREAM_UNAVAILABLE,
+                            &format!("UpstreamUnavailable: {e}"),
+                            None,
+                        );
+                    }
+                };
 
                 match upstream
                     .call_tool(
@@ -807,7 +818,7 @@ impl GatewayRuntime {
                     .await
                 {
                     Ok(result) => {
-                        self.circuit_breaker.record_success(&tool_meta.server_alias);
+                        permit.record_success();
                         let resp_bytes = serde_json::to_vec(&result)
                             .map(|v| v.len())
                             .unwrap_or(usize::MAX);
@@ -849,6 +860,7 @@ impl GatewayRuntime {
                         })
                     }
                     Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
+                        permit.release();
                         let _ = self
                             .tape
                             .append(UnsealedReceipt {
@@ -876,7 +888,7 @@ impl GatewayRuntime {
                         jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
                     }
                     Err(KeelwayError::UpstreamTimeout(ms)) => {
-                        self.circuit_breaker.record_failure(&tool_meta.server_alias);
+                        permit.record_failure();
                         self.metrics.inc_upstream_timeout();
                         let _ = self
                             .record_outcome(
@@ -895,7 +907,9 @@ impl GatewayRuntime {
                     }
                     Err(e) => {
                         if matches!(e, KeelwayError::UpstreamUnavailable(_)) {
-                            self.circuit_breaker.record_failure(&tool_meta.server_alias);
+                            permit.record_failure();
+                        } else {
+                            permit.release();
                         }
                         self.metrics.inc_upstream_error();
                         let _ = self
@@ -1285,15 +1299,18 @@ impl GatewayRuntime {
             &scrubbed_explanation.reason,
         );
 
-        if let Err(e) = self.circuit_breaker.before_call(server) {
-            self.metrics.inc_upstream_error();
-            return jsonrpc_error(
-                id,
-                JSONRPC_UPSTREAM_UNAVAILABLE,
-                &format!("UpstreamUnavailable: {e}"),
-                None,
-            );
-        }
+        let permit = match self.circuit_breaker.before_call(server) {
+            Ok(permit) => permit,
+            Err(e) => {
+                self.metrics.inc_upstream_error();
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_UPSTREAM_UNAVAILABLE,
+                    &format!("UpstreamUnavailable: {e}"),
+                    None,
+                );
+            }
+        };
 
         match upstream
             .call_method(
@@ -1306,7 +1323,7 @@ impl GatewayRuntime {
             .await
         {
             Ok(result) => {
-                self.circuit_breaker.record_success(server);
+                permit.record_success();
                 let resp_bytes = serde_json::to_vec(&result)
                     .map(|v| v.len())
                     .unwrap_or(usize::MAX);
@@ -1356,6 +1373,7 @@ impl GatewayRuntime {
                 })
             }
             Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
+                permit.release();
                 if let Err(e) = self
                     .tape
                     .append(UnsealedReceipt {
@@ -1391,7 +1409,7 @@ impl GatewayRuntime {
                 jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
             }
             Err(KeelwayError::UpstreamTimeout(ms)) => {
-                self.circuit_breaker.record_failure(server);
+                permit.record_failure();
                 self.metrics.inc_upstream_timeout();
                 jsonrpc_error(
                     id,
@@ -1402,7 +1420,9 @@ impl GatewayRuntime {
             }
             Err(e) => {
                 if matches!(e, KeelwayError::UpstreamUnavailable(_)) {
-                    self.circuit_breaker.record_failure(server);
+                    permit.record_failure();
+                } else {
+                    permit.release();
                 }
                 self.metrics.inc_upstream_error();
                 jsonrpc_error(
@@ -1520,10 +1540,11 @@ async fn healthz_handler() -> Response {
 
 async fn readyz_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response {
     let snapshot = runtime.circuit_breaker.snapshot();
-    let any_open = snapshot
+    let open_count = snapshot
         .iter()
-        .any(|(_, state)| *state == CircuitState::Open);
-    let circuits: BTreeMap<String, CircuitState> = snapshot.into_iter().collect();
+        .filter(|(_, state)| *state == CircuitState::Open)
+        .count();
+    let any_open = open_count > 0;
     let status = if any_open {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
@@ -1533,7 +1554,7 @@ async fn readyz_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response 
         status,
         Json(json!({
             "ready": !any_open,
-            "circuits": circuits,
+            "open_circuits": open_count,
         })),
     )
         .into_response()
@@ -1577,51 +1598,65 @@ async fn events_sse_handler(
     }
     let org_id = principal.org_id.clone();
     let rx_owned = runtime.metrics.subscribe();
+    let shutdown_rx = runtime.shutdown_tx.subscribe();
     let sse_stream = futures_util::stream::unfold(
-        (rx_owned, org_id, exp),
-        |(mut rx, org_id, exp)| async move {
+        (rx_owned, shutdown_rx, org_id, exp),
+        |(mut rx, mut shutdown_rx, org_id, exp)| async move {
             loop {
+                if *shutdown_rx.borrow() {
+                    return None;
+                }
                 if let Some(exp_ts) = exp {
                     let now = Utc::now().timestamp().max(0) as u64;
                     if now >= exp_ts {
                         return None;
                     }
                     let remaining = std::time::Duration::from_secs(exp_ts - now);
-                    match tokio::time::timeout(remaining, rx.recv()).await {
-                        Ok(Ok(ev)) => {
-                            if ev.org_id != org_id {
-                                continue;
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return None,
+                        res = tokio::time::timeout(remaining, rx.recv()) => {
+                            match res {
+                                Ok(Ok(ev)) => {
+                                    if ev.org_id != org_id {
+                                        continue;
+                                    }
+                                    let payload =
+                                        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                                    return Some((
+                                        Ok::<Event, std::convert::Infallible>(
+                                            Event::default().data(payload),
+                                        ),
+                                        (rx, shutdown_rx, org_id, exp),
+                                    ));
+                                }
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                                Err(_) => return None,
                             }
-                            let payload =
-                                serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
-                            return Some((
-                                Ok::<Event, std::convert::Infallible>(
-                                    Event::default().data(payload),
-                                ),
-                                (rx, org_id, exp),
-                            ));
                         }
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
-                        Err(_) => return None,
                     }
                 } else {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            if ev.org_id != org_id {
-                                continue;
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => return None,
+                        res = rx.recv() => {
+                            match res {
+                                Ok(ev) => {
+                                    if ev.org_id != org_id {
+                                        continue;
+                                    }
+                                    let payload =
+                                        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                                    return Some((
+                                        Ok::<Event, std::convert::Infallible>(
+                                            Event::default().data(payload),
+                                        ),
+                                        (rx, shutdown_rx, org_id, exp),
+                                    ));
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                             }
-                            let payload =
-                                serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
-                            return Some((
-                                Ok::<Event, std::convert::Infallible>(
-                                    Event::default().data(payload),
-                                ),
-                                (rx, org_id, exp),
-                            ));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
             }
