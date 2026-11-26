@@ -13,6 +13,20 @@ Programmable, security-first Rust execution gateway and policy testbench for aut
 - **SHA-256 hash-chained execution tape:** Dedicated OS-thread group-commit writer (`keelway-tape.jsonl`) with fail-closed persistence and O(1)-memory chain verification.
 - **Offline security development lifecycle:** `keelway init`, `keelway gateway up`, `keelway policy test`, `keelway attack simulate`, `keelway trace inspect`, and `keelway replay --dry-run`.
 
+## Installation
+
+**One-line installer** (macOS Apple Silicon & Linux x86_64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/creova-gif/keelway-mcp-gateway/main/install.sh | sh
+```
+
+**Build from source** with Cargo:
+
+```sh
+cargo install --git https://github.com/creova-gif/keelway-mcp-gateway keelway-cli
+```
+
 ## Quick Start
 
 ```bash
