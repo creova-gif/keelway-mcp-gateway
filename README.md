@@ -74,8 +74,28 @@ Simulation summary: 4/4 defenses held
 Additional lifecycle commands:
 - `keelway gateway up --config ./demo/keelway.yaml` — start the federated MCP gateway
 - `keelway doctor --config ./demo/keelway.yaml` — run offline pre-flight production readiness and security diagnostics
-- `keelway trace inspect --tape ./demo/keelway-tape.jsonl` — verify and inspect the SHA-256 receipt chain
+- `keelway keygen` — generate an Ed25519 signing keypair for audit tape provenance
+- `keelway trace inspect --tape ./demo/keelway-tape.jsonl [--public-key <HEX>]` — verify the SHA-256 receipt chain (and optional Ed25519 signatures) and inspect structured decisions
 - `keelway replay --dry-run` — replay recorded receipts offline against candidate `.cedar` policies (flags `INDETERMINATE` if a validator inspects a scrubbed field)
+
+## Configuration Reference
+
+`keelway.yaml` top-level fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `bind_addr` | `string` | `"127.0.0.1:8080"` | TCP address and port for the HTTP gateway, `/metrics`, `/events`, `/p10/*`, and `/ui`. |
+| `tape_path` | `path` | `"keelway-tape.jsonl"` | Output path for the SHA-256 hash-chained JSONL execution tape. |
+| `policy_files` | `list<path>` | `[]` | Cedar policy files (`.cedar`) loaded at startup and hot-reloaded on `SIGHUP` or `mtime` change. |
+| `principals` | `list<object>` | `[]` | Authenticated principals (`org_id`, `agent_id`, `roles`, and `token_ref` / `secret://` binding). |
+| `servers` | `list<object>` | `[]` | Upstream MCP servers (`stdio` or Streamable HTTP) with alias, transport config, and tool/env bindings. |
+| `validators` | `list<object>` | `[]` | Stage-1 typed argument validator bindings (`path_within`, `glob`, `regex`, `sql_readonly`, `repo_allowlist`). |
+| `budgets` | `list<object>` | `[]` | Per-principal / per-server `max_calls_per_minute` and `max_concurrent_calls` limits (`-32004`). |
+| `approval_required` | `list<object>` | `[]` | P-10 human-in-the-loop approval rules (`org_id`, `agent_id`, `server`, `tool`, `timeout_ms`). |
+| `max_request_bytes` | `integer` | `1048576` | Maximum JSON-RPC request argument size in bytes (`-32006 PayloadTooLarge` if exceeded). |
+| `max_response_bytes` | `integer` | `4194304` | Maximum upstream response size in bytes (`-32006 PayloadTooLarge` if exceeded). |
+| `egress_pattern_scrubbing` | `bool` | `true` | Enables built-in Aho-Corasick/pattern scrubbing for unregistered AWS, GitHub, and PEM credentials. |
+| `signing_key_ref` | `string?` | `null` | Optional `secret://` reference to a 32-byte Ed25519 seed for signing audit tape receipts. |
 
 ## Benchmarks
 

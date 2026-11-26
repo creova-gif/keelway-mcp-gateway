@@ -1453,3 +1453,284 @@ async fn operator_console_ui_serves_html_with_security_headers() -> Result<(), K
 
     Ok(())
 }
+
+#[tokio::test]
+async fn mcp_lifecycle_and_resource_prompt_governance_work_end_to_end() -> Result<(), KeelwayError>
+{
+    let upstream_app = Router::new().route(
+        "/mcp",
+        post(|Json(body): Json<Value>| async move {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+            match method {
+                "resources/read" => {
+                    let uri = body["params"]["uri"].as_str().unwrap_or("");
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "contents": [{
+                                "uri": uri,
+                                "mimeType": "text/plain",
+                                "text": "doc-ok leak=sk-super-secret-resource"
+                            }]
+                        }
+                    }))
+                }
+                "prompts/get" => {
+                    let name = body["params"]["name"].as_str().unwrap_or("");
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "description": format!("prompt {name}"),
+                            "messages": [{
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": "hello secret=sk-super-secret-resource"
+                                }
+                            }]
+                        }
+                    }))
+                }
+                _ => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "unknown method" }
+                })),
+            }
+        }),
+    );
+
+    let up_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let up_addr = up_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(up_listener, upstream_app).await;
+    });
+
+    let tmp = tempdir()?;
+    let tape_path = tmp.path().join("lifecycle-tape.jsonl");
+    let cfg = GatewayConfig {
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "agent-1".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("secret://agent_tok".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "docs".to_owned(),
+            transport: UpstreamTransport::StreamableHttp {
+                url: format!("http://{up_addr}/mcp"),
+                headers: BTreeMap::from([(
+                    "x-api-key".to_owned(),
+                    "secret://upstream_secret".to_owned(),
+                )]),
+            },
+            tools: vec!["ping".to_owned()],
+            timeout_ms: 5000,
+        }],
+        ..GatewayConfig::default()
+    };
+
+    let cedar = r#"
+permit (
+    principal in Role::"developer",
+    action == Action::"read_resource",
+    resource == Tool::"docs/docs://allowed.md"
+);
+permit (
+    principal in Role::"developer",
+    action == Action::"get_prompt",
+    resource == Tool::"docs/summarize"
+);
+"#;
+
+    let mut secrets = HashMap::new();
+    secrets.insert("secret://agent_tok".to_owned(), "tok-lifecycle".to_owned());
+    secrets.insert(
+        "secret://upstream_secret".to_owned(),
+        "sk-super-secret-resource".to_owned(),
+    );
+
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(secrets))?;
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{gw_addr}/mcp");
+    let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    // 1. initialize advertises tools, resources, prompts capabilities
+    let init_resp: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert!(init_resp["result"]["capabilities"]["tools"].is_object());
+    assert!(init_resp["result"]["capabilities"]["resources"].is_object());
+    assert!(init_resp["result"]["capabilities"]["prompts"].is_object());
+
+    // 2. ping and notifications/initialized return {}
+    for (req_id, method) in [(2, "ping"), (3, "notifications/initialized")] {
+        let resp: Value = client
+            .post(&url)
+            .header("authorization", "Bearer tok-lifecycle")
+            .json(&json!({ "jsonrpc": "2.0", "id": req_id, "method": method }))
+            .send()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+        assert_eq!(resp["result"], json!({}));
+    }
+
+    // 3. resources/list and prompts/list return empty lists
+    let res_list: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .json(&json!({ "jsonrpc": "2.0", "id": 4, "method": "resources/list" }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(res_list["result"]["resources"], json!([]));
+
+    let prompt_list: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .json(&json!({ "jsonrpc": "2.0", "id": 5, "method": "prompts/list" }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(prompt_list["result"]["prompts"], json!([]));
+
+    // 4. Default-deny on unpermitted resources/read
+    let denied_read: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .header("traceparent", format!("00-{trace_id}-00f067aa0ba902b7-01"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "resources/read",
+            "params": { "uri": "docs://forbidden.md" }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(denied_read["error"]["code"], -32000);
+
+    // 5. Permitted resources/read (via <server>://<path> URI) scrubs secrets
+    let allowed_read: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .header("traceparent", format!("00-{trace_id}-00f067aa0ba902b7-01"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "resources/read",
+            "params": { "uri": "docs://allowed.md" }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    let read_text = allowed_read["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(read_text.contains("doc-ok"));
+    assert!(!read_text.contains("sk-super-secret-resource"));
+    assert!(read_text.contains("[REDACTED]"));
+
+    // 6. Permitted prompts/get scrubs secrets
+    let allowed_prompt: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .header("traceparent", format!("00-{trace_id}-00f067aa0ba902b7-01"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "prompts/get",
+            "params": { "server": "docs", "name": "summarize" }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    let prompt_text = allowed_prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(prompt_text.contains("hello"));
+    assert!(!prompt_text.contains("sk-super-secret-resource"));
+    assert!(prompt_text.contains("[REDACTED]"));
+
+    // 7. Verify audit tape receipts & trace_id provenance
+    let verified = GatewayEngine::verify_tape_with_key(&tape_path, None)?;
+    assert_eq!(verified.count, 3);
+    let mut receipts = Vec::new();
+    GatewayEngine::inspect_tape(&tape_path, |r| {
+        receipts.push((
+            r.server.clone(),
+            r.tool.clone(),
+            r.decision,
+            r.state,
+            r.provenance
+                .as_ref()
+                .and_then(|p| p.get("trace_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        ));
+        Ok(())
+    })?;
+    assert_eq!(
+        receipts,
+        vec![
+            (
+                "docs".to_owned(),
+                "docs://forbidden.md".to_owned(),
+                Decision::Deny,
+                ReceiptState::Blocked,
+                Some(trace_id.to_owned())
+            ),
+            (
+                "docs".to_owned(),
+                "docs://allowed.md".to_owned(),
+                Decision::Allow,
+                ReceiptState::Sealed,
+                Some(trace_id.to_owned())
+            ),
+            (
+                "docs".to_owned(),
+                "summarize".to_owned(),
+                Decision::Allow,
+                ReceiptState::Sealed,
+                Some(trace_id.to_owned())
+            ),
+        ]
+    );
+
+    Ok(())
+}

@@ -144,6 +144,16 @@ impl PolicyEngine {
         principal: &Principal,
         tool_call: &ToolCall,
     ) -> Result<PolicyDecision, KeelwayError> {
+        self.evaluate_action(principal, "call_tool", tool_call)
+    }
+
+    /// Evaluates a governed action (`call_tool`, `read_resource`, `get_prompt`) through Stage 1 and Stage 2 (Cedar).
+    pub fn evaluate_action(
+        &self,
+        principal: &Principal,
+        action_name: &str,
+        call: &ToolCall,
+    ) -> Result<PolicyDecision, KeelwayError> {
         let snap = self.snapshot.load();
 
         // Stage 1: Evaluate typed argument validators bound to (server, tool)
@@ -151,8 +161,8 @@ impl PolicyEngine {
         let mut validator_bools: BTreeMap<String, bool> = BTreeMap::new();
 
         for v in &snap.validators {
-            if v.server == tool_call.server && v.tool == tool_call.tool {
-                let arg_val = tool_call.arguments.get(&v.arg_name);
+            if v.server == call.server && v.tool == call.tool {
+                let arg_val = call.arguments.get(&v.arg_name);
                 let outcome = evaluate_validator(v, arg_val);
                 validator_bools.insert(v.id.clone(), outcome.passed);
                 outcomes.push(outcome);
@@ -165,9 +175,9 @@ impl PolicyEngine {
         // Stage 2: Pure-Rust Cedar evaluation (default-deny, forbid-overrides-permit)
         let req = build_cedar_request(
             principal,
-            "call_tool",
-            &tool_call.server,
-            &tool_call.tool,
+            action_name,
+            &call.server,
+            &call.tool,
             &validator_bools,
             &snap.validators,
             &snap.schema,
@@ -383,6 +393,24 @@ action "call_tool" appliesTo {{
 {arg_check_fields}        }},
     }},
 }};
+
+action "read_resource" appliesTo {{
+    principal: [Agent],
+    resource: [Tool],
+    context: {{
+        arg_checks: {{
+{arg_check_fields}        }},
+    }},
+}};
+
+action "get_prompt" appliesTo {{
+    principal: [Agent],
+    resource: [Tool],
+    context: {{
+        arg_checks: {{
+{arg_check_fields}        }},
+    }},
+}};
 "#
     );
     let (schema, _warnings) = Schema::from_cedarschema_str(&schema_src).map_err(|e| {
@@ -510,7 +538,7 @@ fn build_cedar_request(
     let resource_uid =
         EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
 
-    let context = if action_name == "call_tool" {
+    let context = if action_name != "list_tool" {
         let mut checks_map = serde_json::Map::new();
         for v in validators {
             let val = validator_bools.get(&v.id).copied().unwrap_or(false);
