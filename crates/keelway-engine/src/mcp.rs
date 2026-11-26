@@ -163,15 +163,33 @@ impl UpstreamDriver {
         max_response_bytes: usize,
         trace_id: Option<&str>,
     ) -> Result<Value, KeelwayError> {
+        self.call_method(
+            "tools/call",
+            json!({
+                "name": upstream_tool,
+                "arguments": arguments,
+            }),
+            scrubber,
+            max_response_bytes,
+            trace_id,
+        )
+        .await
+    }
+
+    async fn call_method(
+        &self,
+        method: &str,
+        params: Value,
+        scrubber: &Arc<SecretScrubber>,
+        max_response_bytes: usize,
+        trace_id: Option<&str>,
+    ) -> Result<Value, KeelwayError> {
         let req_id = uuid::Uuid::new_v4().to_string();
         let rpc_body = json!({
             "jsonrpc": "2.0",
             "id": req_id,
-            "method": "tools/call",
-            "params": {
-                "name": upstream_tool,
-                "arguments": arguments,
-            }
+            "method": method,
+            "params": params,
         });
 
         match self {
@@ -227,6 +245,9 @@ impl UpstreamDriver {
                     }
                     let scrubbed = scrubber.scrub_str(&resp_line);
                     let parsed: Value = serde_json::from_str(&scrubbed)?;
+                    if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
+                        return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
+                    }
                     Ok(parsed.get("result").cloned().unwrap_or(parsed))
                 };
 
@@ -306,6 +327,9 @@ impl UpstreamDriver {
                 let parsed: Value = serde_json::from_str(&assembled).unwrap_or_else(
                     |_| json!({ "content": [{ "type": "text", "text": assembled }] }),
                 );
+                if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
+                    return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
+                }
                 Ok(parsed.get("result").cloned().unwrap_or(parsed))
             }
         }
@@ -472,8 +496,13 @@ impl GatewayRuntime {
         trace_id: Option<&str>,
     ) -> Value {
         let base_provenance = trace_id.map(|tid| json!({ "trace_id": tid }));
+        let is_notification = req.get("id").is_none();
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+
+        if is_notification && method == "notifications/initialized" {
+            return Value::Null;
+        }
 
         match method {
             "initialize" => json!({
@@ -482,8 +511,23 @@ impl GatewayRuntime {
                 "result": {
                     "protocolVersion": "2025-03-26",
                     "serverInfo": { "name": "keelway-mcp-gateway", "version": env!("CARGO_PKG_VERSION") },
-                    "capabilities": { "tools": {} }
+                    "capabilities": { "tools": {}, "resources": {}, "prompts": {} }
                 }
+            }),
+            "ping" | "notifications/initialized" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {}
+            }),
+            "resources/list" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "resources": [] }
+            }),
+            "prompts/list" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "prompts": [] }
             }),
             "tools/list" => {
                 let visible: Vec<Value> = self
@@ -1053,7 +1097,451 @@ impl GatewayRuntime {
                     }
                 }
             }
+            "resources/read" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(uri) = uri else {
+                    return jsonrpc_error(id, -32602, "missing required params.uri", None);
+                };
+                let server = params
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        uri.split_once("://")
+                            .map(|(s, _)| s)
+                            .filter(|s| !s.is_empty())
+                    });
+                let Some(server) = server else {
+                    return jsonrpc_error(
+                        id,
+                        -32602,
+                        "missing params.server and uri is not '<server>://<path>'",
+                        None,
+                    );
+                };
+                self.handle_governed_upstream_method(
+                    principal,
+                    id,
+                    trace_id,
+                    "read_resource",
+                    "resources/read",
+                    server,
+                    uri,
+                    &params,
+                    json!({ "uri": uri }),
+                )
+                .await
+            }
+            "prompts/get" => {
+                let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+                let server = params
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let (Some(server), Some(name)) = (server, name) else {
+                    return jsonrpc_error(
+                        id,
+                        -32602,
+                        "missing required params.server or params.name",
+                        None,
+                    );
+                };
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let upstream_params = json!({ "name": name, "arguments": arguments });
+                self.handle_governed_upstream_method(
+                    principal,
+                    id,
+                    trace_id,
+                    "get_prompt",
+                    "prompts/get",
+                    server,
+                    name,
+                    &arguments,
+                    upstream_params,
+                )
+                .await
+            }
             _ => jsonrpc_error(id, -32601, &format!("method not found: '{method}'"), None),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_governed_upstream_method(
+        &self,
+        principal: &Principal,
+        id: Value,
+        trace_id: Option<&str>,
+        cedar_action: &str,
+        rpc_method: &str,
+        server: &str,
+        target_name: &str,
+        params: &Value,
+        upstream_params: Value,
+    ) -> Value {
+        let scrubbed_target = self.scrubber.scrub_str(target_name);
+        let receipt_provenance = Some(match trace_id {
+            Some(tid) => json!({ "trace_id": tid, "mcp_action": cedar_action }),
+            None => json!({ "mcp_action": cedar_action }),
+        });
+        let req_bytes = serde_json::to_vec(params)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX);
+        if req_bytes > self.max_request_bytes {
+            let reason = format!(
+                "PayloadTooLarge: request params ({req_bytes} bytes) exceed max_request_bytes ({})",
+                self.max_request_bytes
+            );
+            if let Err(e) = self
+                .tape
+                .append(UnsealedReceipt {
+                    timestamp: Utc::now(),
+                    org_id: principal.org_id.clone(),
+                    agent_id: principal.agent_id.clone(),
+                    server: server.to_owned(),
+                    tool: scrubbed_target.clone(),
+                    redacted_args: Value::Null,
+                    redacted_fields: vec![],
+                    decision: Decision::Deny,
+                    explanation: Explanation {
+                        decision: Decision::Deny,
+                        rule_ids: vec!["payload_limit".to_owned()],
+                        validator_outcomes: vec![],
+                        reason: reason.clone(),
+                        policy_digest: String::new(),
+                    },
+                    policy_digest: String::new(),
+                    state: ReceiptState::Blocked,
+                    outcome: None,
+                    provenance: receipt_provenance,
+                })
+                .await
+            {
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_TAPE_PERSISTENCE_ERR,
+                    &format!("TapePersistenceError (fail-closed): {e}"),
+                    None,
+                );
+            }
+            return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
+        }
+
+        let (redacted_args, redacted_fields) = self.scrubber.scrub_json(params);
+        let call = ToolCall {
+            server: server.to_owned(),
+            tool: target_name.to_owned(),
+            arguments: params.clone(),
+        };
+
+        let eval = match self.policy.evaluate_action(principal, cedar_action, &call) {
+            Ok(d) => d,
+            Err(e) => {
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_POLICY_DENIED,
+                    &format!("policy evaluation error (fail-closed): {e}"),
+                    None,
+                );
+            }
+        };
+
+        let mut scrubbed_explanation = eval.explanation.clone();
+        scrubbed_explanation.reason = self.scrubber.scrub_str(&scrubbed_explanation.reason);
+        for vo in &mut scrubbed_explanation.validator_outcomes {
+            vo.reason = self.scrubber.scrub_str(&vo.reason);
+        }
+
+        if eval.decision == Decision::Deny {
+            let unsealed = UnsealedReceipt {
+                timestamp: Utc::now(),
+                org_id: principal.org_id.clone(),
+                agent_id: principal.agent_id.clone(),
+                server: server.to_owned(),
+                tool: scrubbed_target.clone(),
+                redacted_args,
+                redacted_fields,
+                decision: eval.decision,
+                explanation: scrubbed_explanation.clone(),
+                policy_digest: scrubbed_explanation.policy_digest.clone(),
+                state: ReceiptState::Blocked,
+                outcome: None,
+                provenance: receipt_provenance,
+            };
+            if let Err(e) = self.tape.append(unsealed).await {
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_TAPE_PERSISTENCE_ERR,
+                    &format!("TapePersistenceError (fail-closed): {e}"),
+                    None,
+                );
+            }
+            self.metrics.record_event(LiveConsoleEvent {
+                timestamp: Utc::now(),
+                org_id: principal.org_id.clone(),
+                agent_id: principal.agent_id.clone(),
+                server: server.to_owned(),
+                tool: scrubbed_target.clone(),
+                decision: eval.decision,
+                state: ReceiptState::Blocked,
+                outcome: EventOutcome::DeniedPolicy,
+                reason: scrubbed_explanation.reason.clone(),
+            });
+            self.emit_console_line(
+                &format!("{server}.{scrubbed_target}"),
+                &principal.agent_id,
+                eval.decision,
+                &scrubbed_explanation.reason,
+            );
+            return jsonrpc_error(
+                id,
+                JSONRPC_POLICY_DENIED,
+                "PolicyDenied",
+                Some(serde_json::to_value(&scrubbed_explanation).unwrap_or(Value::Null)),
+            );
+        }
+
+        // Enforce per-principal/per-server execution budget before upstream dispatch (ADR-003).
+        let _budget_lease = match self.budgets.acquire(principal, server) {
+            Ok(lease) => lease,
+            Err(e) => {
+                let reason = e.to_string();
+                let budget_explanation = Explanation {
+                    decision: Decision::Deny,
+                    rule_ids: vec!["budget".to_owned()],
+                    validator_outcomes: vec![],
+                    reason: reason.clone(),
+                    policy_digest: scrubbed_explanation.policy_digest.clone(),
+                };
+                if let Err(tape_err) = self
+                    .tape
+                    .append(UnsealedReceipt {
+                        timestamp: Utc::now(),
+                        org_id: principal.org_id.clone(),
+                        agent_id: principal.agent_id.clone(),
+                        server: server.to_owned(),
+                        tool: scrubbed_target.clone(),
+                        redacted_args: redacted_args.clone(),
+                        redacted_fields: redacted_fields.clone(),
+                        decision: Decision::Deny,
+                        explanation: budget_explanation.clone(),
+                        policy_digest: budget_explanation.policy_digest.clone(),
+                        state: ReceiptState::Blocked,
+                        outcome: None,
+                        provenance: receipt_provenance,
+                    })
+                    .await
+                {
+                    return jsonrpc_error(
+                        id,
+                        JSONRPC_TAPE_PERSISTENCE_ERR,
+                        &format!("TapePersistenceError (fail-closed): {tape_err}"),
+                        None,
+                    );
+                }
+                self.metrics.record_event(LiveConsoleEvent {
+                    timestamp: Utc::now(),
+                    org_id: principal.org_id.clone(),
+                    agent_id: principal.agent_id.clone(),
+                    server: server.to_owned(),
+                    tool: scrubbed_target.clone(),
+                    decision: Decision::Deny,
+                    state: ReceiptState::Blocked,
+                    outcome: EventOutcome::DeniedBudget,
+                    reason: reason.clone(),
+                });
+                self.emit_console_line(
+                    &format!("{server}.{scrubbed_target}"),
+                    &principal.agent_id,
+                    Decision::Deny,
+                    &reason,
+                );
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_BUDGET_EXCEEDED,
+                    "BudgetExceeded",
+                    Some(serde_json::to_value(&budget_explanation).unwrap_or(Value::Null)),
+                );
+            }
+        };
+
+        let Some(upstream) = self.upstreams.get(server) else {
+            return jsonrpc_error(
+                id,
+                JSONRPC_UPSTREAM_UNAVAILABLE,
+                "UpstreamUnavailable: server driver missing",
+                None,
+            );
+        };
+
+        let unsealed = UnsealedReceipt {
+            timestamp: Utc::now(),
+            org_id: principal.org_id.clone(),
+            agent_id: principal.agent_id.clone(),
+            server: server.to_owned(),
+            tool: scrubbed_target.clone(),
+            redacted_args,
+            redacted_fields,
+            decision: eval.decision,
+            explanation: scrubbed_explanation.clone(),
+            policy_digest: scrubbed_explanation.policy_digest.clone(),
+            state: ReceiptState::Sealed,
+            outcome: None,
+            provenance: receipt_provenance.clone(),
+        };
+        if let Err(e) = self.tape.append(unsealed).await {
+            return jsonrpc_error(
+                id,
+                JSONRPC_TAPE_PERSISTENCE_ERR,
+                &format!("TapePersistenceError (fail-closed): {e}"),
+                None,
+            );
+        }
+
+        self.metrics.record_event(LiveConsoleEvent {
+            timestamp: Utc::now(),
+            org_id: principal.org_id.clone(),
+            agent_id: principal.agent_id.clone(),
+            server: server.to_owned(),
+            tool: scrubbed_target.clone(),
+            decision: eval.decision,
+            state: ReceiptState::Sealed,
+            outcome: EventOutcome::Allowed,
+            reason: scrubbed_explanation.reason.clone(),
+        });
+        self.emit_console_line(
+            &format!("{server}.{scrubbed_target}"),
+            &principal.agent_id,
+            eval.decision,
+            &scrubbed_explanation.reason,
+        );
+
+        match upstream
+            .call_method(
+                rpc_method,
+                upstream_params,
+                &self.scrubber,
+                self.max_response_bytes,
+                trace_id,
+            )
+            .await
+        {
+            Ok(result) => {
+                let resp_bytes = serde_json::to_vec(&result)
+                    .map(|v| v.len())
+                    .unwrap_or(usize::MAX);
+                if resp_bytes > self.max_response_bytes {
+                    let reason = format!(
+                        "PayloadTooLarge: upstream response ({resp_bytes} bytes) exceed max_response_bytes ({})",
+                        self.max_response_bytes
+                    );
+                    if let Err(e) = self
+                        .tape
+                        .append(UnsealedReceipt {
+                            timestamp: Utc::now(),
+                            org_id: principal.org_id.clone(),
+                            agent_id: principal.agent_id.clone(),
+                            server: server.to_owned(),
+                            tool: scrubbed_target,
+                            redacted_args: Value::Null,
+                            redacted_fields: vec![],
+                            decision: Decision::Deny,
+                            explanation: Explanation {
+                                decision: Decision::Deny,
+                                rule_ids: vec!["payload_limit".to_owned()],
+                                validator_outcomes: vec![],
+                                reason: reason.clone(),
+                                policy_digest: eval.explanation.policy_digest,
+                            },
+                            policy_digest: scrubbed_explanation.policy_digest,
+                            state: ReceiptState::Blocked,
+                            outcome: None,
+                            provenance: receipt_provenance,
+                        })
+                        .await
+                    {
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_TAPE_PERSISTENCE_ERR,
+                            &format!("TapePersistenceError (fail-closed): {e}"),
+                            None,
+                        );
+                    }
+                    return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
+                }
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result
+                })
+            }
+            Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
+                if let Err(e) = self
+                    .tape
+                    .append(UnsealedReceipt {
+                        timestamp: Utc::now(),
+                        org_id: principal.org_id.clone(),
+                        agent_id: principal.agent_id.clone(),
+                        server: server.to_owned(),
+                        tool: scrubbed_target,
+                        redacted_args: Value::Null,
+                        redacted_fields: vec![],
+                        decision: Decision::Deny,
+                        explanation: Explanation {
+                            decision: Decision::Deny,
+                            rule_ids: vec!["payload_limit".to_owned()],
+                            validator_outcomes: vec![],
+                            reason: msg.clone(),
+                            policy_digest: eval.explanation.policy_digest,
+                        },
+                        policy_digest: scrubbed_explanation.policy_digest,
+                        state: ReceiptState::Blocked,
+                        outcome: None,
+                        provenance: receipt_provenance,
+                    })
+                    .await
+                {
+                    return jsonrpc_error(
+                        id,
+                        JSONRPC_TAPE_PERSISTENCE_ERR,
+                        &format!("TapePersistenceError (fail-closed): {e}"),
+                        None,
+                    );
+                }
+                jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
+            }
+            Err(KeelwayError::UpstreamTimeout(ms)) => {
+                self.metrics.inc_upstream_timeout();
+                jsonrpc_error(
+                    id,
+                    JSONRPC_UPSTREAM_TIMEOUT,
+                    &format!("UpstreamTimeout after {ms}ms"),
+                    None,
+                )
+            }
+            Err(e) => {
+                self.metrics.inc_upstream_error();
+                jsonrpc_error(
+                    id,
+                    JSONRPC_UPSTREAM_UNAVAILABLE,
+                    &format!("UpstreamUnavailable: {e}"),
+                    None,
+                )
+            }
         }
     }
 
@@ -1337,9 +1825,13 @@ async fn http_mcp_handler(
 
     let trace_id =
         extract_or_generate_trace_id(headers.get("traceparent").and_then(|v| v.to_str().ok()));
+    let is_notification = body.get("id").is_none();
     let resp = runtime
         .handle_rpc_request_with_trace(&principal, body, Some(&trace_id))
         .await;
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
     (StatusCode::OK, Json(resp)).into_response()
 }
 
@@ -1364,10 +1856,19 @@ pub async fn serve_stdio_loop(
         if trimmed.is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<Value>(trimmed) {
-            Ok(req) => runtime.handle_rpc_request(&principal, req).await,
-            Err(e) => jsonrpc_error(Value::Null, -32700, &format!("parse error: {e}"), None),
+        let (is_notification, resp) = match serde_json::from_str::<Value>(trimmed) {
+            Ok(req) => {
+                let is_notif = req.get("id").is_none();
+                (is_notif, runtime.handle_rpc_request(&principal, req).await)
+            }
+            Err(e) => (
+                false,
+                jsonrpc_error(Value::Null, -32700, &format!("parse error: {e}"), None),
+            ),
         };
+        if is_notification {
+            continue;
+        }
         let mut out = serde_json::to_string(&resp)?;
         out.push('\n');
         stdout.write_all(out.as_bytes()).await?;

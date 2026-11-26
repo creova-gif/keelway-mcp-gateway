@@ -5,6 +5,9 @@ use keelway_engine::{
 };
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -61,6 +64,11 @@ enum Commands {
         #[arg(long, default_value = "keelway.yaml")]
         config: PathBuf,
     },
+    /// Generate a random 32-byte Ed25519 signing key for audit tape provenance
+    Keygen {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -111,6 +119,9 @@ enum TraceAction {
     Inspect {
         #[arg(long, default_value = "keelway-tape.jsonl")]
         tape: PathBuf,
+        /// Optional hex-encoded Ed25519 verifying (public) key to verify receipt signatures
+        #[arg(long)]
+        public_key: Option<String>,
     },
 }
 
@@ -251,9 +262,27 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             })
         }
         Commands::Trace {
-            action: TraceAction::Inspect { tape },
+            action: TraceAction::Inspect { tape, public_key },
         } => {
             let verification = GatewayEngine::inspect_tape(&tape, |r| {
+                if let Some(ref vk) = public_key {
+                    let sig_hex = r
+                        .provenance
+                        .as_ref()
+                        .and_then(|p| p.get("signature_hex"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            keelway_engine::core::KeelwayError::Tape(format!(
+                                "missing Ed25519 provenance signature at seq {}",
+                                r.seq
+                            ))
+                        })?;
+                    keelway_engine::provenance::TapeSigner::verify_hex(
+                        vk,
+                        r.entry_hash.as_bytes(),
+                        sig_hex,
+                    )?;
+                }
                 let badge = match r.decision {
                     Decision::Allow => "ALLOWED",
                     Decision::Deny => "BLOCKED",
@@ -269,11 +298,19 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 );
                 Ok(())
             })?;
-            println!(
-                "tape #{} chain verified (head: {})",
-                verification.count,
-                &verification.head_hash[..16.min(verification.head_hash.len())]
-            );
+            if public_key.is_some() {
+                println!(
+                    "tape #{} chain and Ed25519 signatures verified (head: {})",
+                    verification.count,
+                    &verification.head_hash[..16.min(verification.head_hash.len())]
+                );
+            } else {
+                println!(
+                    "tape #{} chain verified (head: {})",
+                    verification.count,
+                    &verification.head_hash[..16.min(verification.head_hash.len())]
+                );
+            }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Replay {
@@ -321,6 +358,44 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Doctor { config } => run_doctor(&config),
+        Commands::Keygen { output } => {
+            let seed_hex = format!(
+                "{}{}",
+                keelway_engine::provenance::extract_or_generate_trace_id(None),
+                keelway_engine::provenance::extract_or_generate_trace_id(None),
+            );
+            let signer = keelway_engine::provenance::TapeSigner::from_seed_str(&seed_hex)?;
+            let key_id = signer.key_id();
+            let verifying_key_hex = signer.verifying_key_hex();
+
+            if let Some(path) = output {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut opts = fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                opts.mode(0o600);
+                let mut file = opts.open(&path)?;
+                writeln!(file, "{seed_hex}")?;
+                println!("Generated Ed25519 signing key:");
+                println!("  key_id:        {key_id}");
+                println!("  verifying_key: {verifying_key_hex}");
+                println!("  saved_to:      {}", path.display());
+                println!(
+                    "  config_hint:   signing_key_ref: \"secret://file/{}\"",
+                    path.display()
+                );
+            } else {
+                println!("Generated Ed25519 signing key:");
+                println!("  seed_hex:      {seed_hex}");
+                println!("  key_id:        {key_id}");
+                println!("  verifying_key: {verifying_key_hex}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -1167,6 +1242,143 @@ servers:
             fail_stdio_cfg.as_os_str(),
         ]))?;
         assert!(run(fail_stdio_cli).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_keygen_and_trace_inspect_public_key_work() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = TempDirGuard::new("keygen-trace-inspect")?;
+        let dir = tmp.path();
+        let key_file = dir.join("keys/signing.key");
+
+        let keygen_stdout_cli =
+            Cli::try_parse_from(os_args(&["keelway".as_ref(), "keygen".as_ref()]))?;
+        assert_eq!(run(keygen_stdout_cli).await?, ExitCode::SUCCESS);
+
+        let keygen_out_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "keygen".as_ref(),
+            "--output".as_ref(),
+            key_file.as_os_str(),
+        ]))?;
+        assert_eq!(run(keygen_out_cli).await?, ExitCode::SUCCESS);
+
+        let raw_seed = fs::read_to_string(&key_file)?;
+        assert!(raw_seed.ends_with('\n'));
+        let seed_hex = raw_seed.trim();
+        assert_eq!(seed_hex.len(), 64);
+        assert!(seed_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_file)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let signer = keelway_engine::provenance::TapeSigner::from_seed_str(seed_hex)?;
+        let vk_hex = signer.verifying_key_hex();
+        let entry_hash = "421425e932601c4b85ddc231d0b35778e1e4ede107423fa77036f325ffe09154";
+        let sig_hex = signer.sign_hex(entry_hash.as_bytes());
+
+        let signed_tape = dir.join("signed-tape.jsonl");
+        let signed_receipt: keelway_engine::Receipt = serde_json::from_value(serde_json::json!({
+            "seq": 1,
+            "prev_hash": keelway_engine::GENESIS_HASH,
+            "entry_hash": entry_hash,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "org_id": "acme",
+            "agent_id": "coding-agent",
+            "server": "local-fs",
+            "tool": "read_file",
+            "redacted_args": {},
+            "redacted_fields": [],
+            "decision": "ALLOW",
+            "explanation": {
+                "decision": "ALLOW",
+                "rule_ids": [],
+                "validator_outcomes": [],
+                "reason": "test",
+                "policy_digest": "abc123"
+            },
+            "policy_digest": "abc123",
+            "state": "SEALED",
+            "provenance": {
+                "key_id": signer.key_id(),
+                "signature_hex": sig_hex
+            }
+        }))?;
+        fs::write(
+            &signed_tape,
+            format!("{}\n", serde_json::to_string(&signed_receipt)?),
+        )?;
+
+        let inspect_ok = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "trace".as_ref(),
+            "inspect".as_ref(),
+            "--tape".as_ref(),
+            signed_tape.as_os_str(),
+            "--public-key".as_ref(),
+            vk_hex.as_ref(),
+        ]))?;
+        assert_eq!(run(inspect_ok).await?, ExitCode::SUCCESS);
+
+        let wrong_signer = keelway_engine::provenance::TapeSigner::from_seed_str(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )?;
+        let wrong_vk = wrong_signer.verifying_key_hex();
+        let inspect_wrong_key = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "trace".as_ref(),
+            "inspect".as_ref(),
+            "--tape".as_ref(),
+            signed_tape.as_os_str(),
+            "--public-key".as_ref(),
+            wrong_vk.as_ref(),
+        ]))?;
+        assert!(run(inspect_wrong_key).await.is_err());
+
+        let unsigned_tape = dir.join("unsigned-tape.jsonl");
+        let unsigned_receipt: keelway_engine::Receipt =
+            serde_json::from_value(serde_json::json!({
+                "seq": 1,
+                "prev_hash": keelway_engine::GENESIS_HASH,
+                "entry_hash": entry_hash,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "org_id": "acme",
+                "agent_id": "coding-agent",
+                "server": "local-fs",
+                "tool": "read_file",
+                "redacted_args": {},
+                "redacted_fields": [],
+                "decision": "ALLOW",
+                "explanation": {
+                    "decision": "ALLOW",
+                    "rule_ids": [],
+                    "validator_outcomes": [],
+                    "reason": "test",
+                    "policy_digest": "abc123"
+                },
+                "policy_digest": "abc123",
+                "state": "SEALED"
+            }))?;
+        fs::write(
+            &unsigned_tape,
+            format!("{}\n", serde_json::to_string(&unsigned_receipt)?),
+        )?;
+        let inspect_unsigned = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "trace".as_ref(),
+            "inspect".as_ref(),
+            "--tape".as_ref(),
+            unsigned_tape.as_os_str(),
+            "--public-key".as_ref(),
+            vk_hex.as_ref(),
+        ]))?;
+        assert!(run(inspect_unsigned).await.is_err());
 
         Ok(())
     }

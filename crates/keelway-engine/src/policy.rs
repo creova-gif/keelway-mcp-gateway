@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -132,9 +133,12 @@ impl PolicyEngine {
         ) else {
             return false;
         };
+        let Ok(entities) = entities_with_tool(&snap.entities, &snap.schema, server, tool) else {
+            return false;
+        };
         let resp = self
             .authorizer
-            .is_authorized(&req, &snap.policy_set, &snap.entities);
+            .is_authorized(&req, &snap.policy_set, entities.as_ref());
         matches!(resp.decision(), CedarDecision::Allow)
     }
 
@@ -144,6 +148,16 @@ impl PolicyEngine {
         principal: &Principal,
         tool_call: &ToolCall,
     ) -> Result<PolicyDecision, KeelwayError> {
+        self.evaluate_action(principal, "call_tool", tool_call)
+    }
+
+    /// Evaluates a governed action (`call_tool`, `read_resource`, `get_prompt`) through Stage 1 and Stage 2 (Cedar).
+    pub fn evaluate_action(
+        &self,
+        principal: &Principal,
+        action_name: &str,
+        call: &ToolCall,
+    ) -> Result<PolicyDecision, KeelwayError> {
         let snap = self.snapshot.load();
 
         // Stage 1: Evaluate typed argument validators bound to (server, tool)
@@ -151,8 +165,8 @@ impl PolicyEngine {
         let mut validator_bools: BTreeMap<String, bool> = BTreeMap::new();
 
         for v in &snap.validators {
-            if v.server == tool_call.server && v.tool == tool_call.tool {
-                let arg_val = tool_call.arguments.get(&v.arg_name);
+            if v.server == call.server && v.tool == call.tool {
+                let arg_val = call.arguments.get(&v.arg_name);
                 let outcome = evaluate_validator(v, arg_val);
                 validator_bools.insert(v.id.clone(), outcome.passed);
                 outcomes.push(outcome);
@@ -165,16 +179,17 @@ impl PolicyEngine {
         // Stage 2: Pure-Rust Cedar evaluation (default-deny, forbid-overrides-permit)
         let req = build_cedar_request(
             principal,
-            "call_tool",
-            &tool_call.server,
-            &tool_call.tool,
+            action_name,
+            &call.server,
+            &call.tool,
             &validator_bools,
             &snap.validators,
             &snap.schema,
         )?;
+        let entities = entities_with_tool(&snap.entities, &snap.schema, &call.server, &call.tool)?;
         let resp = self
             .authorizer
-            .is_authorized(&req, &snap.policy_set, &snap.entities);
+            .is_authorized(&req, &snap.policy_set, entities.as_ref());
 
         let decision = match resp.decision() {
             CedarDecision::Allow => Decision::Allow,
@@ -383,6 +398,24 @@ action "call_tool" appliesTo {{
 {arg_check_fields}        }},
     }},
 }};
+
+action "read_resource" appliesTo {{
+    principal: [Agent],
+    resource: [Tool],
+    context: {{
+        arg_checks: {{
+{arg_check_fields}        }},
+    }},
+}};
+
+action "get_prompt" appliesTo {{
+    principal: [Agent],
+    resource: [Tool],
+    context: {{
+        arg_checks: {{
+{arg_check_fields}        }},
+    }},
+}};
 "#
     );
     let (schema, _warnings) = Schema::from_cedarschema_str(&schema_src).map_err(|e| {
@@ -487,6 +520,39 @@ fn build_static_entities(
         .map_err(|e| KeelwayError::Policy(format!("failed to build cedar entities: {e}")))
 }
 
+/// Ensures a `Tool` entity with `server` and `name` attributes exists for `(server, tool)`,
+/// supporting dynamically addressed `resources/read` URIs and `prompts/get` names.
+fn entities_with_tool<'a>(
+    base: &'a Entities,
+    schema: &Schema,
+    server: &str,
+    tool: &str,
+) -> Result<Cow<'a, Entities>, KeelwayError> {
+    let tool_type = EntityTypeName::from_str("Tool")
+        .map_err(|e| KeelwayError::Policy(format!("entity type Tool error: {e}")))?;
+    let uid =
+        EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
+    if base.get(&uid).is_some() {
+        return Ok(Cow::Borrowed(base));
+    }
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "server".to_owned(),
+        RestrictedExpression::new_string(server.to_owned()),
+    );
+    attrs.insert(
+        "name".to_owned(),
+        RestrictedExpression::new_string(tool.to_owned()),
+    );
+    let ent = Entity::new(uid, attrs, HashSet::new())
+        .map_err(|e| KeelwayError::Policy(format!("dynamic tool entity error: {e}")))?;
+    let updated = base
+        .clone()
+        .add_entities(std::iter::once(ent), Some(schema))
+        .map_err(|e| KeelwayError::Policy(format!("failed to add dynamic tool entity: {e}")))?;
+    Ok(Cow::Owned(updated))
+}
+
 fn build_cedar_request(
     principal: &Principal,
     action_name: &str,
@@ -510,7 +576,7 @@ fn build_cedar_request(
     let resource_uid =
         EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
 
-    let context = if action_name == "call_tool" {
+    let context = if action_name != "list_tool" {
         let mut checks_map = serde_json::Map::new();
         for v in validators {
             let val = validator_bools.get(&v.id).copied().unwrap_or(false);
@@ -943,6 +1009,51 @@ permit(
 "#;
         assert!(engine.hot_reload_from_cedar(&cfg, bad_cedar).is_err());
         assert_eq!(engine.current_digest(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_resource_and_prompt_attribute_forbid_works() -> Result<(), KeelwayError> {
+        let cfg = sample_config();
+        let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"read_resource",
+    resource
+);
+forbid(
+    principal,
+    action == Action::"read_resource",
+    resource
+) when {
+    resource.server == "github"
+};
+"#;
+        let engine = PolicyEngine::from_config_and_cedar(&cfg, cedar)?;
+        let dev = cfg.principals[0].to_principal();
+
+        let denied = engine.evaluate_action(
+            &dev,
+            "read_resource",
+            &ToolCall {
+                server: "github".to_owned(),
+                tool: "github://secret.md".to_owned(),
+                arguments: json!({}),
+            },
+        )?;
+        assert_eq!(denied.decision, Decision::Deny);
+        assert!(denied.explanation.reason.contains("explicit forbid"));
+
+        let allowed = engine.evaluate_action(
+            &dev,
+            "read_resource",
+            &ToolCall {
+                server: "filesystem".to_owned(),
+                tool: "filesystem://readme.md".to_owned(),
+                arguments: json!({}),
+            },
+        )?;
+        assert_eq!(allowed.decision, Decision::Allow);
         Ok(())
     }
 }
