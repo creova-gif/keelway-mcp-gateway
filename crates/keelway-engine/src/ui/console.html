@@ -38,6 +38,44 @@
       line-height: 1.45;
     }
 
+    .skip-link {
+      position: absolute;
+      left: -9999px;
+      top: 0;
+      z-index: 100;
+      padding: 8px 14px;
+      background: #1d4ed8;
+      color: #ffffff;
+      font-weight: 600;
+      font-size: 13px;
+      border-radius: 6px;
+      text-decoration: none;
+    }
+
+    .skip-link:focus,
+    .skip-link:focus-visible {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    .skip-link:focus-visible,
+    [tabindex]:focus-visible {
+      outline: 2px solid #60a5fa;
+      outline-offset: 2px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+
     header.topbar {
       position: sticky;
       top: 0;
@@ -114,8 +152,11 @@
     }
 
     input:focus {
-      outline: none;
       border-color: var(--accent);
+    }
+
+    input:focus:not(:focus-visible) {
+      outline: none;
     }
 
     button {
@@ -426,6 +467,7 @@
   </style>
 </head>
 <body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
   <header class="topbar">
     <div class="brand">
       <span>Keelway MCP Gateway</span>
@@ -441,7 +483,7 @@
     </form>
   </header>
 
-  <main>
+  <main id="main-content" tabindex="-1">
     <section aria-labelledby="metrics-heading">
       <div class="section-header">
         <h2 id="metrics-heading" class="section-title">Gateway Metrics</h2>
@@ -456,8 +498,8 @@
           <h2 id="p10-heading" class="section-title">P-10 Approval Queue</h2>
           <span id="p10-count" class="section-meta">0 pending</span>
         </div>
-        <div id="p10-notice" class="notice" hidden></div>
-        <div id="p10-list" class="stack">
+        <div id="p10-notice" class="notice" aria-live="polite" hidden></div>
+        <div id="p10-list" class="stack" aria-live="polite">
           <div class="empty">Connect with a Bearer token to inspect pending P-10 approvals.</div>
         </div>
       </section>
@@ -466,12 +508,12 @@
         <div class="section-header">
           <h2 id="stream-heading" class="section-title">Live Decision Stream</h2>
           <div class="auth-controls">
-            <span id="stream-status" class="section-meta">Idle</span>
+            <span id="stream-status" class="section-meta" aria-live="polite">Idle</span>
             <button id="clear-stream-btn" type="button">Clear</button>
           </div>
         </div>
-        <div id="stream-notice" class="notice" hidden></div>
-        <div id="stream-list" class="stream-list">
+        <div id="stream-notice" class="notice" aria-live="polite" hidden></div>
+        <div id="stream-list" class="stream-list" aria-live="polite">
           <div class="empty">Connect with a Bearer token to subscribe to /events.</div>
         </div>
       </section>
@@ -644,7 +686,17 @@
         }
       }
 
+      var lastPendingKey = null;
+
       function renderPendingGates(items) {
+        var key = items.map(function (item) {
+          return String(item.approval_id || '');
+        }).join(',');
+        if (key === lastPendingKey) {
+          return;
+        }
+        lastPendingKey = key;
+
         clearChildren(els.p10List);
         els.p10Count.textContent = items.length + ' pending';
 

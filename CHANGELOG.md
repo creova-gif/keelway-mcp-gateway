@@ -14,10 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Operational Metrics & Health Telemetry**: Added `uptime_seconds` to `GET /healthz`, exposed `keelway_active_upstream_inflight` and `keelway_circuits_open` Prometheus gauges on `GET /metrics`, and added `Open Circuits`, `Active In-Flight`, and `Gateway Uptime` cards to the Operator Console (`GET /ui`).
 - **Router-Wide Security Headers**: Applied defensive HTTP security headers across all gateway router responses.
 - **Container & Compose Deployment**: Added production `Dockerfile` and `deploy/compose.yaml` for containerized gateway deployments.
-- **Trace Inspection Filters**: Added `--tail`, `--trace-id`, and `--decision` filtering options to `keelway trace inspect`.
+- **Trace Inspection Filters**: Added `--tail`, `--trace-id`, `--decision`, and `--outcome` filtering options to `keelway trace inspect`.
 
 ### Changed
 - **BudgetTracker Idle Bucket Eviction**: Added automatic eviction of idle sliding-window rate-limit buckets in `BudgetTracker` to bound long-running memory usage.
+- **Operator Console Accessibility (`GET /ui`)**: Added WCAG 2.1 AA accessibility enhancements to the embedded operator console.
+- **Release Benchmarks (`v0.3.0`)**: Refreshed measured local release benchmarks for `keelway-engine v0.3.0` in `README.md`.
 
 ## [0.3.0] - 2026-11-26
 
