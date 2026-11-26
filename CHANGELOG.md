@@ -16,11 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Container & Compose Deployment**: Added production `Dockerfile`, `deploy/compose.yaml`, and `.env.example` for containerized gateway deployments.
 - **Repository Governance & Dependency Automation**: Added `.github/CODEOWNERS` and `.github/dependabot.yml`.
 - **Trace Inspection Filters**: Added `--tail`, `--trace-id`, `--decision`, and `--outcome` filtering options to `keelway trace inspect`.
+- **Structured JSON Logging (`KEELWAY_LOG_FORMAT=json`)**: Added `KEELWAY_LOG_FORMAT=json` support for machine-parseable JSON tracing logs alongside the default human-readable format.
+- **HTTP API Reference (`docs/API.md`)**: Added reference documentation covering gateway HTTP/JSON-RPC endpoints, authentication, and operational routes.
+- **Concurrent Multi-Principal Stress & Isolation Test**: Added `concurrent_mixed_principals_preserve_tape_chain_and_budget_isolation` in `gateway_e2e` verifying strict per-principal budget isolation and hash-chained tape integrity under concurrent mixed-principal load.
 
 ### Changed
 - **BudgetTracker Idle Bucket Eviction**: Added automatic eviction of idle sliding-window rate-limit buckets in `BudgetTracker` to bound long-running memory usage.
 - **Operator Console (`GET /ui`)**: Added WCAG 2.1 AA accessibility enhancements and live stream filtering, search, and pause controls to the embedded operator console.
-- **Preflight Validation (`keelway doctor`)**: Added positive-bound validation rejecting zero values for `max_request_bytes`, `max_response_bytes`, and `circuit_breaker_failure_threshold`.
+- **Preflight Validation (`keelway doctor`)**: Added positive-bound validation rejecting zero values for `max_request_bytes`, `max_response_bytes`, and `circuit_breaker_failure_threshold`, plus tape directory writability checks and `KEELWAY_TAPE_PATH` override support.
 - **Release Benchmarks (`v0.3.0`)**: Refreshed measured local release benchmarks for `keelway-engine v0.3.0` in `README.md`.
 
 ## [0.3.0] - 2026-11-26

@@ -182,11 +182,7 @@ impl TraceOutcomeFilter {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Always route tracing logs to stderr (strictly required for stdio MCP framing safety)
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
+    init_tracing();
 
     match run(cli).await {
         Ok(code) => code,
@@ -194,6 +190,24 @@ async fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn init_tracing() {
+    // Always route tracing logs to stderr (strictly required for stdio MCP framing safety)
+    let is_json =
+        std::env::var("KEELWAY_LOG_FORMAT").is_ok_and(|v| v.trim().eq_ignore_ascii_case("json"));
+    if is_json {
+        let _ = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
     }
 }
 
@@ -740,7 +754,11 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let tape_path = if config.tape_path.is_absolute() {
+    let tape_path = if let Ok(env_path) = std::env::var("KEELWAY_TAPE_PATH")
+        && !env_path.trim().is_empty()
+    {
+        PathBuf::from(env_path)
+    } else if config.tape_path.is_absolute() {
         config.tape_path.clone()
     } else {
         base_dir.join(&config.tape_path)
@@ -768,6 +786,42 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
             }
         }
     } else {
+        let parent = match tape_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let probe_path = parent.join(format!(".keelway-doctor-probe-{}", std::process::id()));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(file) => {
+                drop(file);
+                let _ = fs::remove_file(&probe_path);
+                checks.push(DoctorCheck {
+                    status: "PASS",
+                    name: "Tape Path".to_owned(),
+                    detail: format!(
+                        "parent '{}' is writable for '{}'",
+                        parent.display(),
+                        tape_path.display()
+                    ),
+                });
+            }
+            Err(e) => {
+                failures += 1;
+                checks.push(DoctorCheck {
+                    status: "FAIL",
+                    name: "Tape Path".to_owned(),
+                    detail: format!(
+                        "parent '{}' is not writable for '{}': {e}",
+                        parent.display(),
+                        tape_path.display()
+                    ),
+                });
+            }
+        }
         checks.push(DoctorCheck {
             status: "SKIP",
             name: "Tape Integrity".to_owned(),
@@ -1915,6 +1969,74 @@ jwt_auth:
             weak_cfg.as_os_str(),
         ]))?;
         assert!(run(weak_cli).await.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn cli_doctor_checks_tape_parent_writability() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("doctor-tape-parent")?;
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("policies"))?;
+        fs::write(
+            dir.join("policies/simple.cedar"),
+            "permit(principal in Role::\"developer\", action == Action::\"list_tool\", resource);\n",
+        )?;
+
+        let blocking_file = dir.join("not-a-directory");
+        fs::write(&blocking_file, "file")?;
+        let bad_tape = blocking_file.join("keelway-tape.jsonl");
+
+        let bad_cfg = dir.join("bad-tape.yaml");
+        fs::write(
+            &bad_cfg,
+            format!(
+                r#"bind_addr: "127.0.0.1:8080"
+tape_path: "{tape}"
+policy_files:
+  - "policies/simple.cedar"
+"#,
+                tape = bad_tape.display()
+            ),
+        )?;
+
+        let err = run_doctor(&bad_cfg)
+            .err()
+            .ok_or("expected doctor to fail")?;
+        assert!(
+            err.to_string().contains("failing check"),
+            "unexpected error: {err}"
+        );
+
+        let missing_dir_tape = dir.join("missing-subdir/keelway-tape.jsonl");
+        let missing_cfg = dir.join("missing-tape-dir.yaml");
+        fs::write(
+            &missing_cfg,
+            format!(
+                r#"bind_addr: "127.0.0.1:8080"
+tape_path: "{tape}"
+policy_files:
+  - "policies/simple.cedar"
+"#,
+                tape = missing_dir_tape.display()
+            ),
+        )?;
+        assert!(run_doctor(&missing_cfg).is_err());
+
+        let good_cfg = dir.join("good-tape.yaml");
+        fs::write(
+            &good_cfg,
+            r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/simple.cedar"
+"#,
+        )?;
+        assert_eq!(run_doctor(&good_cfg)?, ExitCode::SUCCESS);
+        assert!(
+            !dir.join(format!(".keelway-doctor-probe-{}", std::process::id()))
+                .exists()
+        );
 
         Ok(())
     }

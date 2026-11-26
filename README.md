@@ -114,6 +114,8 @@ See [benchmarks/competitor-dx-notes.md](benchmarks/competitor-dx-notes.md) for m
 
 ## Documentation & Governance
 
+- **API Reference:** [docs/API.md](docs/API.md)
+- **Deployment Guide:** [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 - **Product & Engineering Roadmap:** [docs/ROADMAP.md](docs/ROADMAP.md)
 - **Architecture & M1 Design:** [docs/designs/keelway-mcp-gateway-m1.md](docs/designs/keelway-mcp-gateway-m1.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)

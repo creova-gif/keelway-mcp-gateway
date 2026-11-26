@@ -42,6 +42,8 @@ spec:
               value: "0.0.0.0:8080"
             - name: KEELWAY_TAPE_PATH
               value: "/var/lib/keelway/keelway-tape.jsonl"
+            - name: KEELWAY_LOG_FORMAT
+              value: "json"
           securityContext:
             runAsNonRoot: true
             readOnlyRootFilesystem: true
