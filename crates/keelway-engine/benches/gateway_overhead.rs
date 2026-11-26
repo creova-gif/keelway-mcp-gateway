@@ -132,6 +132,7 @@ fn run_bench() -> Result<(), KeelwayError> {
                 kind: ValidatorKind::SqlReadonly,
             },
         ],
+        ..Default::default()
     };
 
     let engine = GatewayEngine::from_in_memory(cfg, BENCH_CEDAR)?;
