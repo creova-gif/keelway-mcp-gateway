@@ -169,7 +169,10 @@ impl GatewayRuntime {
         );
         let budgets = BudgetTracker::new(config.budgets.clone());
         let p10 = P10GateManager::new(config.approval_required.clone());
-        let circuit_breaker = CircuitBreaker::default();
+        let circuit_breaker = CircuitBreaker::new(
+            config.circuit_breaker_failure_threshold,
+            std::time::Duration::from_secs(config.circuit_breaker_cooldown_secs),
+        );
         let metrics = Arc::new(GatewayMetrics::new());
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
 

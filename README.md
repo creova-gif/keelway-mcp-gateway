@@ -75,7 +75,7 @@ Additional lifecycle commands:
 - `keelway gateway up --config ./demo/keelway.yaml` — start the federated MCP gateway
 - `keelway doctor --config ./demo/keelway.yaml` — run offline pre-flight production readiness and security diagnostics
 - `keelway keygen` — generate an Ed25519 signing keypair for audit tape provenance
-- `keelway trace inspect --tape ./demo/keelway-tape.jsonl [--public-key <HEX>]` — verify the SHA-256 receipt chain (and optional Ed25519 signatures) and inspect structured decisions
+- `keelway trace inspect --tape ./demo/keelway-tape.jsonl [--public-key <HEX>] [--tail <N>] [--trace-id <ID>] [--decision <DECISION>]` — verify the SHA-256 receipt chain (and optional Ed25519 signatures) and inspect structured decisions with optional tail, trace ID, and decision filters
 - `keelway replay --dry-run` — replay recorded receipts offline against candidate `.cedar` policies (flags `INDETERMINATE` if a validator inspects a scrubbed field)
 
 ## Configuration Reference
@@ -97,6 +97,8 @@ Additional lifecycle commands:
 | `egress_pattern_scrubbing` | `bool` | `true` | Enables built-in Aho-Corasick/pattern scrubbing for unregistered AWS, GitHub, and PEM credentials. |
 | `signing_key_ref` | `string?` | `null` | Optional `secret://` reference to a 32-byte Ed25519 seed for signing audit tape receipts. |
 | `jwt_auth` | `object?` | `null` | Optional `JwtConfig` for stateless JWT/OIDC bearer authentication (`issuer`, `audience`, `hs256_secret`, `ed25519_public_key_hex`, `jwks_url`, claim mappings). |
+| `circuit_breaker_failure_threshold` | `integer` | `5` | Consecutive upstream failures before opening an upstream circuit breaker. |
+| `circuit_breaker_cooldown_secs` | `integer` | `15` | Seconds an open circuit breaker waits before allowing a half-open probe call. |
 
 ## Benchmarks
 

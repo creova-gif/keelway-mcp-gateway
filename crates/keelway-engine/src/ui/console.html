@@ -495,7 +495,10 @@
         { key: 'calls:denied_auth', label: 'Denied (Auth)', tone: 'err' },
         { key: 'calls:denied_budget', label: 'Denied (Budget)', tone: 'warn' },
         { key: 'errors:timeout', label: 'Upstream Timeouts', tone: 'warn' },
-        { key: 'errors:error', label: 'Upstream Errors', tone: 'err' }
+        { key: 'errors:error', label: 'Upstream Errors', tone: 'err' },
+        { key: 'circuits_open', label: 'Open Circuits', tone: 'err' },
+        { key: 'active_upstream_inflight', label: 'Active In-Flight', tone: 'warn' },
+        { key: 'gateway_uptime_seconds', label: 'Gateway Uptime', tone: 'ok' }
       ];
 
       var els = {
@@ -583,6 +586,21 @@
           var mPending = line.match(/^keelway_p10_pending\s+([0-9eE.+\-]+)$/);
           if (mPending) {
             parsed['p10_pending'] = mPending[1];
+            continue;
+          }
+          var mCircuitsOpen = line.match(/^keelway_circuits_open\s+([0-9eE.+\-]+)$/);
+          if (mCircuitsOpen) {
+            parsed['circuits_open'] = mCircuitsOpen[1];
+            continue;
+          }
+          var mInflight = line.match(/^keelway_active_upstream_inflight\s+([0-9eE.+\-]+)$/);
+          if (mInflight) {
+            parsed['active_upstream_inflight'] = mInflight[1];
+            continue;
+          }
+          var mUptime = line.match(/^keelway_gateway_uptime_seconds\s+([0-9eE.+\-]+)$/);
+          if (mUptime) {
+            parsed['gateway_uptime_seconds'] = mUptime[1] + 's';
           }
         }
         return parsed;

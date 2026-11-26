@@ -187,6 +187,10 @@ pub struct GatewayConfig {
     pub signing_key_ref: Option<String>,
     #[serde(default)]
     pub jwt_auth: Option<crate::auth::JwtConfig>,
+    #[serde(default = "default_circuit_breaker_failure_threshold")]
+    pub circuit_breaker_failure_threshold: u32,
+    #[serde(default = "default_circuit_breaker_cooldown_secs")]
+    pub circuit_breaker_cooldown_secs: u64,
 }
 
 impl Default for GatewayConfig {
@@ -205,6 +209,8 @@ impl Default for GatewayConfig {
             egress_pattern_scrubbing: default_egress_pattern_scrubbing(),
             signing_key_ref: None,
             jwt_auth: None,
+            circuit_breaker_failure_threshold: default_circuit_breaker_failure_threshold(),
+            circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
         }
     }
 }
@@ -267,6 +273,14 @@ fn default_max_response_bytes() -> usize {
 
 fn default_egress_pattern_scrubbing() -> bool {
     true
+}
+
+fn default_circuit_breaker_failure_threshold() -> u32 {
+    5
+}
+
+fn default_circuit_breaker_cooldown_secs() -> u64 {
+    15
 }
 
 /// Configured principal and authentication token binding.
