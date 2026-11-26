@@ -76,6 +76,7 @@ fn run_bench() -> Result<(), KeelwayError> {
         bind_addr: "127.0.0.1:0".to_owned(),
         tape_path: PathBuf::from("unused.jsonl"),
         policy_files: vec![],
+        budgets: vec![],
         principals: vec![
             PrincipalConfig {
                 org_id: "acme".to_owned(),

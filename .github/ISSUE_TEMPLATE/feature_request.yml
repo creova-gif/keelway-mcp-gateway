@@ -1,0 +1,24 @@
+name: Feature Request
+description: Propose a new capability, typed validator, or CLI workflow for Keelway MCP Gateway
+title: "[feat]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Use Case
+      description: What systems or security problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Design
+      description: Describe the proposed behavior, CLI/config surface, and how fail-closed invariants are preserved.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Other approaches or workarounds considered.

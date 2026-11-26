@@ -1,3 +1,4 @@
+use crate::budget::BudgetTracker;
 use crate::core::{
     Decision, ExecutionOutcome, Explanation, GatewayConfig, KeelwayError, Principal, ReceiptState,
     ServerConfig, ToolCall, UnsealedReceipt, UpstreamTransport, sanitize_federated_name,
@@ -28,6 +29,7 @@ pub const JSONRPC_POLICY_DENIED: i64 = -32000;
 pub const JSONRPC_TAPE_PERSISTENCE_ERR: i64 = -32001;
 pub const JSONRPC_UPSTREAM_TIMEOUT: i64 = -32002;
 pub const JSONRPC_UPSTREAM_UNAVAILABLE: i64 = -32003;
+pub const JSONRPC_BUDGET_EXCEEDED: i64 = -32004;
 
 /// Metadata for a federated upstream MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,7 +295,14 @@ fn spawn_stdio_child(
 ) -> Result<StdioProcess, KeelwayError> {
     let mut cmd = Command::new(command);
     cmd.args(args)
-        .envs(resolved_env)
+        // Clear inherited host env so operator secrets never leak to untrusted stdio children (ADR-003).
+        .env_clear();
+    for safe_key in ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"] {
+        if let Ok(val) = std::env::var(safe_key) {
+            cmd.env(safe_key, val);
+        }
+    }
+    cmd.envs(resolved_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -339,6 +348,7 @@ pub struct GatewayRuntime {
     pub tape: TapeWriter,
     pub scrubber: Arc<SecretScrubber>,
     pub registry: ToolRegistry,
+    budgets: BudgetTracker,
     token_map: HashMap<String, Principal>,
     upstreams: HashMap<String, UpstreamDriver>,
     console_to_stderr: bool,
@@ -387,12 +397,14 @@ impl GatewayRuntime {
 
         let registry = ToolRegistry::build(federated_tools)?;
         let scrubber = Arc::new(SecretScrubber::new(&collected_secrets)?);
+        let budgets = BudgetTracker::new(config.budgets.clone());
 
         Ok(Self {
             policy,
             tape,
             scrubber,
             registry,
+            budgets,
             token_map,
             upstreams,
             console_to_stderr,
@@ -533,6 +545,51 @@ impl GatewayRuntime {
                         Some(serde_json::to_value(&scrubbed_explanation).unwrap_or(Value::Null)),
                     );
                 }
+
+                // Enforce per-principal/per-server execution budget before upstream dispatch (ADR-003).
+                let _budget_lease = match self.budgets.acquire(principal, &tool_meta.server_alias) {
+                    Ok(lease) => lease,
+                    Err(e) => {
+                        let reason = e.to_string();
+                        let budget_explanation = Explanation {
+                            decision: Decision::Deny,
+                            rule_ids: vec!["budget".to_owned()],
+                            validator_outcomes: vec![],
+                            reason: reason.clone(),
+                            policy_digest: scrubbed_explanation.policy_digest.clone(),
+                        };
+                        let _ = self
+                            .tape
+                            .append(UnsealedReceipt {
+                                timestamp: Utc::now(),
+                                org_id: principal.org_id.clone(),
+                                agent_id: principal.agent_id.clone(),
+                                server: tool_meta.server_alias.clone(),
+                                tool: tool_meta.upstream_name.clone(),
+                                redacted_args: Value::Null,
+                                redacted_fields: vec![],
+                                decision: Decision::Deny,
+                                explanation: budget_explanation.clone(),
+                                policy_digest: budget_explanation.policy_digest.clone(),
+                                state: ReceiptState::Blocked,
+                                outcome: None,
+                                provenance: None,
+                            })
+                            .await;
+                        self.emit_console_line(
+                            &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
+                            &principal.agent_id,
+                            Decision::Deny,
+                            &reason,
+                        );
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_BUDGET_EXCEEDED,
+                            "BudgetExceeded",
+                            Some(serde_json::to_value(&budget_explanation).unwrap_or(Value::Null)),
+                        );
+                    }
+                };
 
                 // Dispatch to upstream MCP server
                 let Some(upstream) = self.upstreams.get(&tool_meta.server_alias) else {
