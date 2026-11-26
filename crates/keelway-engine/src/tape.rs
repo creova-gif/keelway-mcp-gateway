@@ -1,5 +1,6 @@
 use crate::core::{Decision, KeelwayError, Principal, Receipt, ToolCall, UnsealedReceipt};
 use crate::policy::PolicyEngine;
+use crate::provenance::TapeSigner;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -54,7 +55,16 @@ pub struct TapeWriter {
 impl TapeWriter {
     /// Opens or creates `path`, verifies existing SHA-256 chain integrity (fail-closed),
     /// and spawns a dedicated OS thread for serialized group-commit appends.
+    #[allow(dead_code)]
     pub fn open(path: PathBuf) -> Result<Self, KeelwayError> {
+        Self::open_with_signer(path, None)
+    }
+
+    /// Opens or creates `path` with an optional Ed25519 `TapeSigner` for receipt provenance.
+    pub fn open_with_signer(
+        path: PathBuf,
+        signer: Option<TapeSigner>,
+    ) -> Result<Self, KeelwayError> {
         let (initial_seq, initial_hash) = if path.exists() {
             let v = verify_tape(&path)?;
             (v.count, v.head_hash)
@@ -74,7 +84,7 @@ impl TapeWriter {
         std::thread::Builder::new()
             .name("keelway-tape-writer".to_owned())
             .spawn(move || {
-                run_writer_loop(file, initial_seq, initial_hash, &mut rx);
+                run_writer_loop(file, initial_seq, initial_hash, &mut rx, signer.as_ref());
             })
             .map_err(|e| {
                 KeelwayError::Tape(format!(
@@ -107,6 +117,7 @@ fn run_writer_loop(
     mut seq: u64,
     mut prev_hash: String,
     rx: &mut mpsc::Receiver<WriteCommand>,
+    signer: Option<&TapeSigner>,
 ) {
     while let Some(first) = rx.blocking_recv() {
         // Group-commit batching: drain all immediately queued receipts in one fsync
@@ -125,7 +136,7 @@ fn run_writer_loop(
 
         for cmd in batch {
             let next_seq = seq + 1;
-            let receipt_res = seal_receipt(next_seq, &prev_hash, cmd.unsealed);
+            let receipt_res = seal_receipt(next_seq, &prev_hash, cmd.unsealed, signer);
             match receipt_res {
                 Ok(receipt) => match serde_json::to_string(&receipt) {
                     Ok(line) => {
@@ -171,13 +182,25 @@ fn run_writer_loop(
 pub fn compute_entry_hash(receipt: &Receipt) -> Result<String, KeelwayError> {
     let mut clone = receipt.clone();
     clone.entry_hash.clear();
+    if let Some(serde_json::Value::Object(map)) = clone.provenance.as_mut() {
+        map.remove("key_id");
+        map.remove("signature_hex");
+        if map.is_empty() {
+            clone.provenance = None;
+        }
+    }
     let canonical = serde_json::to_vec(&clone)?;
     let mut hasher = Sha256::new();
     hasher.update(canonical);
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn seal_receipt(seq: u64, prev_hash: &str, u: UnsealedReceipt) -> Result<Receipt, KeelwayError> {
+fn seal_receipt(
+    seq: u64,
+    prev_hash: &str,
+    u: UnsealedReceipt,
+    signer: Option<&TapeSigner>,
+) -> Result<Receipt, KeelwayError> {
     let mut receipt = Receipt {
         seq,
         prev_hash: prev_hash.to_owned(),
@@ -197,59 +220,52 @@ fn seal_receipt(seq: u64, prev_hash: &str, u: UnsealedReceipt) -> Result<Receipt
         provenance: u.provenance,
     };
     receipt.entry_hash = compute_entry_hash(&receipt)?;
+    if let Some(s) = signer {
+        let sig_hex = s.sign_hex(receipt.entry_hash.as_bytes());
+        let mut map = match receipt.provenance.take() {
+            Some(serde_json::Value::Object(existing)) => existing,
+            _ => serde_json::Map::new(),
+        };
+        map.insert(
+            "key_id".to_owned(),
+            serde_json::Value::String(s.key_id().to_owned()),
+        );
+        map.insert(
+            "signature_hex".to_owned(),
+            serde_json::Value::String(sig_hex),
+        );
+        receipt.provenance = Some(serde_json::Value::Object(map));
+    }
     Ok(receipt)
 }
 
 /// Verifies `keelway-tape.jsonl` in O(1) memory using streaming `BufReader`.
 pub fn verify_tape(path: &Path) -> Result<TapeVerification, KeelwayError> {
-    let file = File::open(path).map_err(|e| {
-        KeelwayError::Tape(format!("failed to open tape '{}': {e}", path.display()))
-    })?;
-    let reader = BufReader::new(file);
-    let mut expected_seq = 0u64;
-    let mut expected_prev = GENESIS_HASH.to_owned();
+    verify_tape_with_key(path, None)
+}
 
-    for (line_idx, line_res) in reader.lines().enumerate() {
-        let line = line_res?;
-        if line.trim().is_empty() {
-            continue;
+/// Verifies `keelway-tape.jsonl` SHA-256 chain and, when `verifying_key_hex` is provided,
+/// verifies the Ed25519 signature on every receipt.
+pub fn verify_tape_with_key(
+    path: &Path,
+    verifying_key_hex: Option<&str>,
+) -> Result<TapeVerification, KeelwayError> {
+    stream_receipts(path, |receipt| {
+        if let Some(vk) = verifying_key_hex {
+            let sig_hex = receipt
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("signature_hex"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    KeelwayError::Tape(format!(
+                        "missing Ed25519 provenance signature at seq {}",
+                        receipt.seq
+                    ))
+                })?;
+            TapeSigner::verify_hex(vk, receipt.entry_hash.as_bytes(), sig_hex)?;
         }
-        let receipt: Receipt = serde_json::from_str(&line).map_err(|e| {
-            KeelwayError::Tape(format!(
-                "corrupted JSON at line {} of '{}': {e}",
-                line_idx + 1,
-                path.display()
-            ))
-        })?;
-        expected_seq += 1;
-        if receipt.seq != expected_seq {
-            return Err(KeelwayError::Tape(format!(
-                "sequence gap at line {}: expected seq {}, got {}",
-                line_idx + 1,
-                expected_seq,
-                receipt.seq
-            )));
-        }
-        if receipt.prev_hash != expected_prev {
-            return Err(KeelwayError::Tape(format!(
-                "broken hash chain at seq {}: prev_hash mismatch",
-                receipt.seq
-            )));
-        }
-        let recomputed = compute_entry_hash(&receipt)?;
-        if receipt.entry_hash != recomputed {
-            return Err(KeelwayError::Tape(format!(
-                "tampered receipt at seq {}: entry_hash mismatch",
-                receipt.seq
-            )));
-        }
-        expected_prev = receipt.entry_hash;
-    }
-
-    Ok(TapeVerification {
-        count: expected_seq,
-        head_hash: expected_prev,
-        valid: true,
+        Ok(())
     })
 }
 
@@ -468,6 +484,36 @@ mod tests {
         std::fs::write(&tape_path, tampered)?;
 
         assert!(TapeWriter::open(tape_path).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_tape_verifies_and_detects_forged_signature() -> Result<(), KeelwayError> {
+        let dir = tempdir()?;
+        let tape_path = dir.path().join("signed-tape.jsonl");
+        let seed_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let signer = TapeSigner::from_seed_str(seed_hex)?;
+        let vk_hex = signer.verifying_key_hex();
+
+        let writer = TapeWriter::open_with_signer(tape_path.clone(), Some(signer))?;
+        let mut unsealed = dummy_unsealed(1);
+        unsealed.provenance =
+            Some(serde_json::json!({ "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736" }));
+        let receipt = writer.append(unsealed).await?;
+        drop(writer);
+
+        assert!(
+            receipt
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("signature_hex"))
+                .is_some()
+        );
+        let v = verify_tape_with_key(&tape_path, Some(&vk_hex))?;
+        assert_eq!(v.count, 1);
+
+        let wrong_vk = "ff".repeat(32);
+        assert!(verify_tape_with_key(&tape_path, Some(&wrong_vk)).is_err());
         Ok(())
     }
 }

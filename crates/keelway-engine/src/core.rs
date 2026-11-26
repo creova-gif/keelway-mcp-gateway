@@ -183,6 +183,8 @@ pub struct GatewayConfig {
     pub max_response_bytes: usize,
     #[serde(default = "default_egress_pattern_scrubbing")]
     pub egress_pattern_scrubbing: bool,
+    #[serde(default)]
+    pub signing_key_ref: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -199,6 +201,7 @@ impl Default for GatewayConfig {
             max_request_bytes: default_max_request_bytes(),
             max_response_bytes: default_max_response_bytes(),
             egress_pattern_scrubbing: default_egress_pattern_scrubbing(),
+            signing_key_ref: None,
         }
     }
 }
