@@ -428,7 +428,7 @@ fn inspect_tape_to_writer(
             .and_then(|v| v.as_str());
 
         if let Some(target_trace_id) = trace_id
-            && receipt_trace_id != Some(target_trace_id)
+            && receipt_trace_id.is_none_or(|tid| !tid.eq_ignore_ascii_case(target_trace_id))
         {
             return Ok(());
         }
