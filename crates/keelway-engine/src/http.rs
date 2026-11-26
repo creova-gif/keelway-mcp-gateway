@@ -276,6 +276,8 @@ async fn http_mcp_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    let trace_id =
+        extract_or_generate_trace_id(headers.get("traceparent").and_then(|v| v.to_str().ok()));
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
     let Some(principal) = runtime.authenticate_bearer_async(auth_header).await else {
         // Record unauthenticated DENY receipt (best-effort; always return 401 fail-closed)
@@ -304,18 +306,17 @@ async fn http_mcp_handler(
                 policy_digest: runtime.policy.current_digest(),
                 state: ReceiptState::Blocked,
                 outcome: None,
-                provenance: None,
+                provenance: Some(json!({ "trace_id": trace_id })),
             })
             .await;
         return (
             StatusCode::UNAUTHORIZED,
+            [("x-trace-id", trace_id)],
             Json(json!({ "error": "unauthenticated" })),
         )
             .into_response();
     };
 
-    let trace_id =
-        extract_or_generate_trace_id(headers.get("traceparent").and_then(|v| v.to_str().ok()));
     let is_notification = body.get("id").is_none();
     let resp = runtime
         .handle_rpc_request_with_trace(&principal, body, Some(&trace_id))

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
@@ -35,6 +35,7 @@ COPY --from=builder /app/target/release/keelway /usr/local/bin/keelway
 
 USER keelway
 
+ENV KEELWAY_BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/keelway"]

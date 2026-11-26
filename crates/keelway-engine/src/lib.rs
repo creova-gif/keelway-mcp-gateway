@@ -249,11 +249,12 @@ impl GatewayEngine {
         )?);
         let app = build_http_router(runtime.clone());
         self.spawn_hot_reload_watcher();
-        let listener = tokio::net::TcpListener::bind(&self.config.bind_addr).await?;
-        tracing::info!(
-            "keelway MCP gateway listening on http://{}/mcp",
-            self.config.bind_addr
-        );
+        let bind_addr = std::env::var("KEELWAY_BIND_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| self.config.bind_addr.clone());
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        tracing::info!("keelway MCP gateway listening on http://{bind_addr}/mcp");
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal(runtime))
             .await
