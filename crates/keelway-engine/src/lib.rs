@@ -2,6 +2,7 @@ pub mod auth;
 pub(crate) mod budget;
 pub mod circuit;
 pub mod core;
+pub(crate) mod http;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
 pub(crate) mod p10;
@@ -12,7 +13,8 @@ pub(crate) mod tape;
 mod upstream;
 
 use crate::core::{GatewayConfig, KeelwayError, PolicyDecision, Principal, ToolCall};
-use crate::mcp::{GatewayRuntime, build_http_router, serve_stdio_loop};
+use crate::http::build_http_router;
+use crate::mcp::{GatewayRuntime, serve_stdio_loop};
 use crate::policy::PolicyEngine;
 use crate::secrets::DefaultSecretProvider;
 use crate::tape::{ReplayEntry, TapeVerification, TapeWriter};

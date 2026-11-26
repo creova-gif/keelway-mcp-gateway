@@ -279,7 +279,8 @@ fn spawn_stdio_child(
     cmd.envs(resolved_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| {
         KeelwayError::UpstreamUnavailable(format!("failed to spawn stdio server '{command}': {e}"))

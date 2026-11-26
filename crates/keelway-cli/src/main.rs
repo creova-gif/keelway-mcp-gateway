@@ -740,6 +740,7 @@ fn resolve_secret_ref_value(reference: &str) -> Result<String, String> {
             return Err("empty file path in secret://file/".to_owned());
         }
         fs::read_to_string(file_path)
+            .map(|s| s.trim_end_matches(['\r', '\n']).to_owned())
             .map_err(|e| format!("failed to read secret file '{file_path}': {e}"))
     } else if reference.starts_with("secret://gcp/") {
         Err("GCP Secret Manager provider is a Milestone 2+ plugin seam; use secret://env/ or secret://file/ in Milestone 1".to_owned())
@@ -1459,6 +1460,15 @@ jwt_auth:
             pass_cfg.as_os_str(),
         ]))?;
         assert_eq!(run(pass_cli).await?, ExitCode::SUCCESS);
+
+        fs::write(&secret_file, format!("{}\n", "a".repeat(32)))?;
+        let pass_newline_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            pass_cfg.as_os_str(),
+        ]))?;
+        assert_eq!(run(pass_newline_cli).await?, ExitCode::SUCCESS);
 
         let weak_cfg = dir.join("jwt-weak.yaml");
         fs::write(

@@ -1133,17 +1133,26 @@ permit(
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
     assert_eq!(resolve_resp.status(), reqwest::StatusCode::OK);
 
-    let call_res: Value = call_task
+    let call_http_resp = call_task
         .await
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?
-        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    let trace_header = call_http_resp
+        .headers()
+        .get("x-trace-id")
+        .and_then(|v| v.to_str().ok());
+    assert!(
+        trace_header.is_some_and(|s| !s.is_empty()),
+        "expected non-empty x-trace-id header on /mcp response"
+    );
+    let call_res: Value = call_http_resp
         .json()
         .await
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
     assert_eq!(call_res["result"]["content"][0]["text"], "ok");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-    // 3. /metrics reflects p10_approved=1 and calls_allowed=1
+    // 3. /metrics reflects p10_approved=1, calls_allowed=1, and keelway_circuits_open
     let metrics_text = client
         .get(format!("{base}/metrics"))
         .send()
@@ -1153,6 +1162,7 @@ permit(
         .await
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
     assert!(metrics_text.contains("keelway_calls_total{outcome=\"p10_approved\"} 1"));
+    assert!(metrics_text.contains("keelway_circuits_open 0"));
 
     // 4. Verify tape recorded AWAITING + SEALED receipts cleanly
     let verified = GatewayEngine::verify_tape(&tape_path)?;
