@@ -100,6 +100,14 @@ impl BudgetTracker {
         })
     }
 
+    /// Returns the total number of active in-flight execution leases across all buckets.
+    pub fn active_in_flight(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|guard| guard.values().map(|b| u64::from(b.in_flight)).sum())
+            .unwrap_or(0)
+    }
+
     fn find_rule(&self, principal: &Principal, server: &str) -> Option<&BudgetRule> {
         if self.rules.is_empty() {
             return None;
@@ -146,8 +154,14 @@ impl Drop for BudgetLease {
     fn drop(&mut self) {
         if let (Some(state), Some(key)) = (self.state.as_ref(), self.key.take()) {
             if let Ok(mut guard) = state.lock() {
-                if let Some(bucket) = guard.get_mut(&key) {
+                let should_remove = if let Some(bucket) = guard.get_mut(&key) {
                     bucket.in_flight = bucket.in_flight.saturating_sub(1);
+                    bucket.in_flight == 0 && bucket.timestamps.is_empty()
+                } else {
+                    false
+                };
+                if should_remove {
+                    guard.remove(&key);
                 }
             }
         }
@@ -279,5 +293,36 @@ mod tests {
         let other_org = principal("other-org", "bot-1");
         assert!(tracker.acquire(&other_org, "github").is_ok());
         assert!(tracker.acquire(&other_org, "github").is_ok());
+    }
+
+    #[test]
+    fn idle_bucket_is_evicted_on_lease_drop() {
+        let tracker = BudgetTracker::new(vec![BudgetRule {
+            org_id: "acme".to_owned(),
+            agent_id: "bot-1".to_owned(),
+            server: "postgres".to_owned(),
+            max_calls_per_minute: None,
+            max_concurrent_calls: Some(4),
+        }]);
+        let p = principal("acme", "bot-1");
+
+        assert_eq!(tracker.active_in_flight(), 0);
+
+        let lease1 = tracker.acquire(&p, "postgres");
+        assert!(lease1.is_ok());
+        assert_eq!(tracker.active_in_flight(), 1);
+
+        let lease2 = tracker.acquire(&p, "postgres");
+        assert!(lease2.is_ok());
+        assert_eq!(tracker.active_in_flight(), 2);
+        assert_eq!(tracker.state.lock().map(|g| g.len()).unwrap_or(0), 1);
+
+        drop(lease1);
+        assert_eq!(tracker.active_in_flight(), 1);
+        assert_eq!(tracker.state.lock().map(|g| g.len()).unwrap_or(0), 1);
+
+        drop(lease2);
+        assert_eq!(tracker.active_in_flight(), 0);
+        assert!(tracker.state.lock().map(|g| g.is_empty()).unwrap_or(false));
     }
 }

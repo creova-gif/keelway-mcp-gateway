@@ -83,7 +83,7 @@ pub struct GatewayRuntime {
     pub tape: TapeWriter,
     pub scrubber: Arc<SecretScrubber>,
     pub registry: ToolRegistry,
-    budgets: BudgetTracker,
+    pub(crate) budgets: BudgetTracker,
     pub(crate) p10: P10GateManager,
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) metrics: Arc<GatewayMetrics>,

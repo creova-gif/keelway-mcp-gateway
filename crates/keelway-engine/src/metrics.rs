@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::sync::broadcast;
 
 const CONSOLE_BROADCAST_CAPACITY: usize = 256;
@@ -46,6 +47,8 @@ pub struct GatewayMetrics {
     pub upstream_errors: AtomicU64,
     pub p10_pending: AtomicU64,
     pub circuits_open: AtomicU64,
+    pub active_inflight: AtomicU64,
+    started_at: Instant,
     console_tx: broadcast::Sender<LiveConsoleEvent>,
 }
 
@@ -70,6 +73,8 @@ impl GatewayMetrics {
             upstream_errors: AtomicU64::new(0),
             p10_pending: AtomicU64::new(0),
             circuits_open: AtomicU64::new(0),
+            active_inflight: AtomicU64::new(0),
+            started_at: Instant::now(),
             console_tx,
         }
     }
@@ -141,6 +146,16 @@ impl GatewayMetrics {
         self.circuits_open.store(count, Ordering::Relaxed);
     }
 
+    /// Sets `active_inflight` to an exact count.
+    pub fn set_active_inflight(&self, count: u64) {
+        self.active_inflight.store(count, Ordering::Relaxed);
+    }
+
+    /// Returns the number of whole seconds elapsed since `GatewayMetrics::new()`.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
     /// Renders all metrics in Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let allowed = self.calls_allowed.load(Ordering::Relaxed);
@@ -153,8 +168,10 @@ impl GatewayMetrics {
         let errors = self.upstream_errors.load(Ordering::Relaxed);
         let pending = self.p10_pending.load(Ordering::Relaxed);
         let circuits_open = self.circuits_open.load(Ordering::Relaxed);
+        let active_inflight = self.active_inflight.load(Ordering::Relaxed);
+        let uptime_seconds = self.uptime_seconds();
 
-        let mut out = String::with_capacity(640);
+        let mut out = String::with_capacity(800);
         let _ = writeln!(
             out,
             "# HELP keelway_calls_total Total number of MCP tool calls processed by outcome."
@@ -209,6 +226,20 @@ impl GatewayMetrics {
         );
         let _ = writeln!(out, "# TYPE keelway_circuits_open gauge");
         let _ = writeln!(out, "keelway_circuits_open {circuits_open}");
+
+        let _ = writeln!(
+            out,
+            "# HELP keelway_active_upstream_inflight Number of upstream MCP tool calls currently in flight."
+        );
+        let _ = writeln!(out, "# TYPE keelway_active_upstream_inflight gauge");
+        let _ = writeln!(out, "keelway_active_upstream_inflight {active_inflight}");
+
+        let _ = writeln!(
+            out,
+            "# HELP keelway_gateway_uptime_seconds Elapsed seconds since gateway metrics initialization."
+        );
+        let _ = writeln!(out, "# TYPE keelway_gateway_uptime_seconds gauge");
+        let _ = writeln!(out, "keelway_gateway_uptime_seconds {uptime_seconds}");
         out
     }
 
@@ -316,6 +347,11 @@ mod tests {
         assert_eq!(metrics.circuits_open.load(Ordering::Relaxed), 2);
         metrics.set_circuits_open(0);
         assert_eq!(metrics.circuits_open.load(Ordering::Relaxed), 0);
+
+        metrics.set_active_inflight(4);
+        assert_eq!(metrics.active_inflight.load(Ordering::Relaxed), 4);
+        metrics.set_active_inflight(0);
+        assert_eq!(metrics.active_inflight.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -333,10 +369,11 @@ mod tests {
         metrics.inc_upstream_error();
         metrics.inc_p10_pending();
         metrics.set_circuits_open(1);
+        metrics.set_active_inflight(3);
 
         let rendered = metrics.render_prometheus();
 
-        let expected = "\
+        let expected_prefix = "\
 # HELP keelway_calls_total Total number of MCP tool calls processed by outcome.
 # TYPE keelway_calls_total counter
 keelway_calls_total{outcome=\"allowed\"} 2
@@ -355,8 +392,17 @@ keelway_p10_pending 1
 # HELP keelway_circuits_open Number of upstream circuit breakers currently in open state.
 # TYPE keelway_circuits_open gauge
 keelway_circuits_open 1
-";
-        assert_eq!(rendered, expected);
+# HELP keelway_active_upstream_inflight Number of upstream MCP tool calls currently in flight.
+# TYPE keelway_active_upstream_inflight gauge
+keelway_active_upstream_inflight 3
+# HELP keelway_gateway_uptime_seconds Elapsed seconds since gateway metrics initialization.
+# TYPE keelway_gateway_uptime_seconds gauge
+keelway_gateway_uptime_seconds ";
+        assert!(rendered.starts_with(expected_prefix));
+        let uptime_line = rendered
+            .strip_prefix(expected_prefix)
+            .and_then(|rest| rest.strip_suffix('\n'));
+        assert!(uptime_line.is_some_and(|v| v.parse::<u64>().is_ok()));
     }
 
     #[tokio::test]
