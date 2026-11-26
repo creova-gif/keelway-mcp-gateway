@@ -245,6 +245,9 @@ impl UpstreamDriver {
                     }
                     let scrubbed = scrubber.scrub_str(&resp_line);
                     let parsed: Value = serde_json::from_str(&scrubbed)?;
+                    if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
+                        return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
+                    }
                     Ok(parsed.get("result").cloned().unwrap_or(parsed))
                 };
 
@@ -324,6 +327,9 @@ impl UpstreamDriver {
                 let parsed: Value = serde_json::from_str(&assembled).unwrap_or_else(
                     |_| json!({ "content": [{ "type": "text", "text": assembled }] }),
                 );
+                if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
+                    return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
+                }
                 Ok(parsed.get("result").cloned().unwrap_or(parsed))
             }
         }
@@ -490,8 +496,13 @@ impl GatewayRuntime {
         trace_id: Option<&str>,
     ) -> Value {
         let base_provenance = trace_id.map(|tid| json!({ "trace_id": tid }));
+        let is_notification = req.get("id").is_none();
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+
+        if is_notification && method == "notifications/initialized" {
+            return Value::Null;
+        }
 
         match method {
             "initialize" => json!({
@@ -1147,10 +1158,11 @@ impl GatewayRuntime {
                         None,
                     );
                 };
-                let upstream_params = match params.get("arguments") {
-                    Some(args) => json!({ "name": name, "arguments": args }),
-                    None => json!({ "name": name }),
-                };
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let upstream_params = json!({ "name": name, "arguments": arguments });
                 self.handle_governed_upstream_method(
                     principal,
                     id,
@@ -1159,7 +1171,7 @@ impl GatewayRuntime {
                     "prompts/get",
                     server,
                     name,
-                    &params,
+                    &arguments,
                     upstream_params,
                 )
                 .await
@@ -1181,7 +1193,11 @@ impl GatewayRuntime {
         params: &Value,
         upstream_params: Value,
     ) -> Value {
-        let base_provenance = trace_id.map(|tid| json!({ "trace_id": tid }));
+        let scrubbed_target = self.scrubber.scrub_str(target_name);
+        let receipt_provenance = Some(match trace_id {
+            Some(tid) => json!({ "trace_id": tid, "mcp_action": cedar_action }),
+            None => json!({ "mcp_action": cedar_action }),
+        });
         let req_bytes = serde_json::to_vec(params)
             .map(|v| v.len())
             .unwrap_or(usize::MAX);
@@ -1190,14 +1206,14 @@ impl GatewayRuntime {
                 "PayloadTooLarge: request params ({req_bytes} bytes) exceed max_request_bytes ({})",
                 self.max_request_bytes
             );
-            let _ = self
+            if let Err(e) = self
                 .tape
                 .append(UnsealedReceipt {
                     timestamp: Utc::now(),
                     org_id: principal.org_id.clone(),
                     agent_id: principal.agent_id.clone(),
                     server: server.to_owned(),
-                    tool: target_name.to_owned(),
+                    tool: scrubbed_target.clone(),
                     redacted_args: Value::Null,
                     redacted_fields: vec![],
                     decision: Decision::Deny,
@@ -1211,9 +1227,17 @@ impl GatewayRuntime {
                     policy_digest: String::new(),
                     state: ReceiptState::Blocked,
                     outcome: None,
-                    provenance: base_provenance,
+                    provenance: receipt_provenance,
                 })
-                .await;
+                .await
+            {
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_TAPE_PERSISTENCE_ERR,
+                    &format!("TapePersistenceError (fail-closed): {e}"),
+                    None,
+                );
+            }
             return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
         }
 
@@ -1248,7 +1272,7 @@ impl GatewayRuntime {
                 org_id: principal.org_id.clone(),
                 agent_id: principal.agent_id.clone(),
                 server: server.to_owned(),
-                tool: target_name.to_owned(),
+                tool: scrubbed_target.clone(),
                 redacted_args,
                 redacted_fields,
                 decision: eval.decision,
@@ -1256,7 +1280,7 @@ impl GatewayRuntime {
                 policy_digest: scrubbed_explanation.policy_digest.clone(),
                 state: ReceiptState::Blocked,
                 outcome: None,
-                provenance: base_provenance,
+                provenance: receipt_provenance,
             };
             if let Err(e) = self.tape.append(unsealed).await {
                 return jsonrpc_error(
@@ -1271,14 +1295,14 @@ impl GatewayRuntime {
                 org_id: principal.org_id.clone(),
                 agent_id: principal.agent_id.clone(),
                 server: server.to_owned(),
-                tool: target_name.to_owned(),
+                tool: scrubbed_target.clone(),
                 decision: eval.decision,
                 state: ReceiptState::Blocked,
                 outcome: EventOutcome::DeniedPolicy,
                 reason: scrubbed_explanation.reason.clone(),
             });
             self.emit_console_line(
-                &format!("{server}.{target_name}"),
+                &format!("{server}.{scrubbed_target}"),
                 &principal.agent_id,
                 eval.decision,
                 &scrubbed_explanation.reason,
@@ -1290,6 +1314,70 @@ impl GatewayRuntime {
                 Some(serde_json::to_value(&scrubbed_explanation).unwrap_or(Value::Null)),
             );
         }
+
+        // Enforce per-principal/per-server execution budget before upstream dispatch (ADR-003).
+        let _budget_lease = match self.budgets.acquire(principal, server) {
+            Ok(lease) => lease,
+            Err(e) => {
+                let reason = e.to_string();
+                let budget_explanation = Explanation {
+                    decision: Decision::Deny,
+                    rule_ids: vec!["budget".to_owned()],
+                    validator_outcomes: vec![],
+                    reason: reason.clone(),
+                    policy_digest: scrubbed_explanation.policy_digest.clone(),
+                };
+                if let Err(tape_err) = self
+                    .tape
+                    .append(UnsealedReceipt {
+                        timestamp: Utc::now(),
+                        org_id: principal.org_id.clone(),
+                        agent_id: principal.agent_id.clone(),
+                        server: server.to_owned(),
+                        tool: scrubbed_target.clone(),
+                        redacted_args: redacted_args.clone(),
+                        redacted_fields: redacted_fields.clone(),
+                        decision: Decision::Deny,
+                        explanation: budget_explanation.clone(),
+                        policy_digest: budget_explanation.policy_digest.clone(),
+                        state: ReceiptState::Blocked,
+                        outcome: None,
+                        provenance: receipt_provenance,
+                    })
+                    .await
+                {
+                    return jsonrpc_error(
+                        id,
+                        JSONRPC_TAPE_PERSISTENCE_ERR,
+                        &format!("TapePersistenceError (fail-closed): {tape_err}"),
+                        None,
+                    );
+                }
+                self.metrics.record_event(LiveConsoleEvent {
+                    timestamp: Utc::now(),
+                    org_id: principal.org_id.clone(),
+                    agent_id: principal.agent_id.clone(),
+                    server: server.to_owned(),
+                    tool: scrubbed_target.clone(),
+                    decision: Decision::Deny,
+                    state: ReceiptState::Blocked,
+                    outcome: EventOutcome::DeniedBudget,
+                    reason: reason.clone(),
+                });
+                self.emit_console_line(
+                    &format!("{server}.{scrubbed_target}"),
+                    &principal.agent_id,
+                    Decision::Deny,
+                    &reason,
+                );
+                return jsonrpc_error(
+                    id,
+                    JSONRPC_BUDGET_EXCEEDED,
+                    "BudgetExceeded",
+                    Some(serde_json::to_value(&budget_explanation).unwrap_or(Value::Null)),
+                );
+            }
+        };
 
         let Some(upstream) = self.upstreams.get(server) else {
             return jsonrpc_error(
@@ -1305,7 +1393,7 @@ impl GatewayRuntime {
             org_id: principal.org_id.clone(),
             agent_id: principal.agent_id.clone(),
             server: server.to_owned(),
-            tool: target_name.to_owned(),
+            tool: scrubbed_target.clone(),
             redacted_args,
             redacted_fields,
             decision: eval.decision,
@@ -1313,7 +1401,7 @@ impl GatewayRuntime {
             policy_digest: scrubbed_explanation.policy_digest.clone(),
             state: ReceiptState::Sealed,
             outcome: None,
-            provenance: base_provenance.clone(),
+            provenance: receipt_provenance.clone(),
         };
         if let Err(e) = self.tape.append(unsealed).await {
             return jsonrpc_error(
@@ -1329,14 +1417,14 @@ impl GatewayRuntime {
             org_id: principal.org_id.clone(),
             agent_id: principal.agent_id.clone(),
             server: server.to_owned(),
-            tool: target_name.to_owned(),
+            tool: scrubbed_target.clone(),
             decision: eval.decision,
             state: ReceiptState::Sealed,
             outcome: EventOutcome::Allowed,
             reason: scrubbed_explanation.reason.clone(),
         });
         self.emit_console_line(
-            &format!("{server}.{target_name}"),
+            &format!("{server}.{scrubbed_target}"),
             &principal.agent_id,
             eval.decision,
             &scrubbed_explanation.reason,
@@ -1361,14 +1449,14 @@ impl GatewayRuntime {
                         "PayloadTooLarge: upstream response ({resp_bytes} bytes) exceed max_response_bytes ({})",
                         self.max_response_bytes
                     );
-                    let _ = self
+                    if let Err(e) = self
                         .tape
                         .append(UnsealedReceipt {
                             timestamp: Utc::now(),
                             org_id: principal.org_id.clone(),
                             agent_id: principal.agent_id.clone(),
                             server: server.to_owned(),
-                            tool: target_name.to_owned(),
+                            tool: scrubbed_target,
                             redacted_args: Value::Null,
                             redacted_fields: vec![],
                             decision: Decision::Deny,
@@ -1382,9 +1470,17 @@ impl GatewayRuntime {
                             policy_digest: scrubbed_explanation.policy_digest,
                             state: ReceiptState::Blocked,
                             outcome: None,
-                            provenance: base_provenance,
+                            provenance: receipt_provenance,
                         })
-                        .await;
+                        .await
+                    {
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_TAPE_PERSISTENCE_ERR,
+                            &format!("TapePersistenceError (fail-closed): {e}"),
+                            None,
+                        );
+                    }
                     return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
                 }
                 json!({
@@ -1394,14 +1490,14 @@ impl GatewayRuntime {
                 })
             }
             Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
-                let _ = self
+                if let Err(e) = self
                     .tape
                     .append(UnsealedReceipt {
                         timestamp: Utc::now(),
                         org_id: principal.org_id.clone(),
                         agent_id: principal.agent_id.clone(),
                         server: server.to_owned(),
-                        tool: target_name.to_owned(),
+                        tool: scrubbed_target,
                         redacted_args: Value::Null,
                         redacted_fields: vec![],
                         decision: Decision::Deny,
@@ -1415,9 +1511,17 @@ impl GatewayRuntime {
                         policy_digest: scrubbed_explanation.policy_digest,
                         state: ReceiptState::Blocked,
                         outcome: None,
-                        provenance: base_provenance,
+                        provenance: receipt_provenance,
                     })
-                    .await;
+                    .await
+                {
+                    return jsonrpc_error(
+                        id,
+                        JSONRPC_TAPE_PERSISTENCE_ERR,
+                        &format!("TapePersistenceError (fail-closed): {e}"),
+                        None,
+                    );
+                }
                 jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
             }
             Err(KeelwayError::UpstreamTimeout(ms)) => {
@@ -1721,9 +1825,13 @@ async fn http_mcp_handler(
 
     let trace_id =
         extract_or_generate_trace_id(headers.get("traceparent").and_then(|v| v.to_str().ok()));
+    let is_notification = body.get("id").is_none();
     let resp = runtime
         .handle_rpc_request_with_trace(&principal, body, Some(&trace_id))
         .await;
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
     (StatusCode::OK, Json(resp)).into_response()
 }
 
@@ -1748,10 +1856,19 @@ pub async fn serve_stdio_loop(
         if trimmed.is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<Value>(trimmed) {
-            Ok(req) => runtime.handle_rpc_request(&principal, req).await,
-            Err(e) => jsonrpc_error(Value::Null, -32700, &format!("parse error: {e}"), None),
+        let (is_notification, resp) = match serde_json::from_str::<Value>(trimmed) {
+            Ok(req) => {
+                let is_notif = req.get("id").is_none();
+                (is_notif, runtime.handle_rpc_request(&principal, req).await)
+            }
+            Err(e) => (
+                false,
+                jsonrpc_error(Value::Null, -32700, &format!("parse error: {e}"), None),
+            ),
         };
+        if is_notification {
+            continue;
+        }
         let mut out = serde_json::to_string(&resp)?;
         out.push('\n');
         stdout.write_all(out.as_bytes()).await?;

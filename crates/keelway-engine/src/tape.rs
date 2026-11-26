@@ -382,8 +382,15 @@ pub fn replay_tape(
             agent_id: receipt.agent_id.clone(),
             roles: principal_roles_lookup(&receipt.org_id, &receipt.agent_id),
         };
-        let eval = policy_engine.evaluate(
+        let action_name = receipt
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("mcp_action"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("call_tool");
+        let eval = policy_engine.evaluate_action(
             &principal,
+            action_name,
             &ToolCall {
                 server: receipt.server.clone(),
                 tool: receipt.tool.clone(),

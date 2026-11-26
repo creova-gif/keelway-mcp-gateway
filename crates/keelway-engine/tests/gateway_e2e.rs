@@ -1580,20 +1580,34 @@ permit (
     assert!(init_resp["result"]["capabilities"]["resources"].is_object());
     assert!(init_resp["result"]["capabilities"]["prompts"].is_object());
 
-    // 2. ping and notifications/initialized return {}
-    for (req_id, method) in [(2, "ping"), (3, "notifications/initialized")] {
-        let resp: Value = client
-            .post(&url)
-            .header("authorization", "Bearer tok-lifecycle")
-            .json(&json!({ "jsonrpc": "2.0", "id": req_id, "method": method }))
-            .send()
+    // 2. ping returns {} and notifications/initialized (without id) returns 202 Accepted
+    let ping_resp: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(ping_resp["result"], json!({}));
+
+    let notif_resp = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .json(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(notif_resp.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        notif_resp
+            .text()
             .await
             .map_err(|e| KeelwayError::Mcp(e.to_string()))?
-            .json()
-            .await
-            .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
-        assert_eq!(resp["result"], json!({}));
-    }
+            .is_empty()
+    );
 
     // 3. resources/list and prompts/list return empty lists
     let res_list: Value = client
@@ -1702,6 +1716,11 @@ permit (
                 .and_then(|p| p.get("trace_id"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            r.provenance
+                .as_ref()
+                .and_then(|p| p.get("mcp_action"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         ));
         Ok(())
     })?;
@@ -1713,21 +1732,24 @@ permit (
                 "docs://forbidden.md".to_owned(),
                 Decision::Deny,
                 ReceiptState::Blocked,
-                Some(trace_id.to_owned())
+                Some(trace_id.to_owned()),
+                Some("read_resource".to_owned())
             ),
             (
                 "docs".to_owned(),
                 "docs://allowed.md".to_owned(),
                 Decision::Allow,
                 ReceiptState::Sealed,
-                Some(trace_id.to_owned())
+                Some(trace_id.to_owned()),
+                Some("read_resource".to_owned())
             ),
             (
                 "docs".to_owned(),
                 "summarize".to_owned(),
                 Decision::Allow,
                 ReceiptState::Sealed,
-                Some(trace_id.to_owned())
+                Some(trace_id.to_owned()),
+                Some("get_prompt".to_owned())
             ),
         ]
     );

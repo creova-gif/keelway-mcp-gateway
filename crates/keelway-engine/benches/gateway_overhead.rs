@@ -11,9 +11,10 @@ mod policy {
             Vec::new()
         }
 
-        pub fn evaluate(
+        pub fn evaluate_action(
             &self,
             _principal: &Principal,
+            _action_name: &str,
             _tool_call: &ToolCall,
         ) -> Result<PolicyDecision, KeelwayError> {
             Err(KeelwayError::Policy("unused in tape bench".to_owned()))

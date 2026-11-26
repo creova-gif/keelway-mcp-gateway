@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -132,9 +133,12 @@ impl PolicyEngine {
         ) else {
             return false;
         };
+        let Ok(entities) = entities_with_tool(&snap.entities, &snap.schema, server, tool) else {
+            return false;
+        };
         let resp = self
             .authorizer
-            .is_authorized(&req, &snap.policy_set, &snap.entities);
+            .is_authorized(&req, &snap.policy_set, entities.as_ref());
         matches!(resp.decision(), CedarDecision::Allow)
     }
 
@@ -182,9 +186,10 @@ impl PolicyEngine {
             &snap.validators,
             &snap.schema,
         )?;
+        let entities = entities_with_tool(&snap.entities, &snap.schema, &call.server, &call.tool)?;
         let resp = self
             .authorizer
-            .is_authorized(&req, &snap.policy_set, &snap.entities);
+            .is_authorized(&req, &snap.policy_set, entities.as_ref());
 
         let decision = match resp.decision() {
             CedarDecision::Allow => Decision::Allow,
@@ -513,6 +518,39 @@ fn build_static_entities(
 
     Entities::from_entities(entities, Some(schema))
         .map_err(|e| KeelwayError::Policy(format!("failed to build cedar entities: {e}")))
+}
+
+/// Ensures a `Tool` entity with `server` and `name` attributes exists for `(server, tool)`,
+/// supporting dynamically addressed `resources/read` URIs and `prompts/get` names.
+fn entities_with_tool<'a>(
+    base: &'a Entities,
+    schema: &Schema,
+    server: &str,
+    tool: &str,
+) -> Result<Cow<'a, Entities>, KeelwayError> {
+    let tool_type = EntityTypeName::from_str("Tool")
+        .map_err(|e| KeelwayError::Policy(format!("entity type Tool error: {e}")))?;
+    let uid =
+        EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
+    if base.get(&uid).is_some() {
+        return Ok(Cow::Borrowed(base));
+    }
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "server".to_owned(),
+        RestrictedExpression::new_string(server.to_owned()),
+    );
+    attrs.insert(
+        "name".to_owned(),
+        RestrictedExpression::new_string(tool.to_owned()),
+    );
+    let ent = Entity::new(uid, attrs, HashSet::new())
+        .map_err(|e| KeelwayError::Policy(format!("dynamic tool entity error: {e}")))?;
+    let updated = base
+        .clone()
+        .add_entities(std::iter::once(ent), Some(schema))
+        .map_err(|e| KeelwayError::Policy(format!("failed to add dynamic tool entity: {e}")))?;
+    Ok(Cow::Owned(updated))
 }
 
 fn build_cedar_request(
@@ -971,6 +1009,51 @@ permit(
 "#;
         assert!(engine.hot_reload_from_cedar(&cfg, bad_cedar).is_err());
         assert_eq!(engine.current_digest(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_resource_and_prompt_attribute_forbid_works() -> Result<(), KeelwayError> {
+        let cfg = sample_config();
+        let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"read_resource",
+    resource
+);
+forbid(
+    principal,
+    action == Action::"read_resource",
+    resource
+) when {
+    resource.server == "github"
+};
+"#;
+        let engine = PolicyEngine::from_config_and_cedar(&cfg, cedar)?;
+        let dev = cfg.principals[0].to_principal();
+
+        let denied = engine.evaluate_action(
+            &dev,
+            "read_resource",
+            &ToolCall {
+                server: "github".to_owned(),
+                tool: "github://secret.md".to_owned(),
+                arguments: json!({}),
+            },
+        )?;
+        assert_eq!(denied.decision, Decision::Deny);
+        assert!(denied.explanation.reason.contains("explicit forbid"));
+
+        let allowed = engine.evaluate_action(
+            &dev,
+            "read_resource",
+            &ToolCall {
+                server: "filesystem".to_owned(),
+                tool: "filesystem://readme.md".to_owned(),
+                arguments: json!({}),
+            },
+        )?;
+        assert_eq!(allowed.decision, Decision::Allow);
         Ok(())
     }
 }

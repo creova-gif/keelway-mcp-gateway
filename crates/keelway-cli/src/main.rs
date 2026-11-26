@@ -5,6 +5,9 @@ use keelway_engine::{
 };
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tracing_subscriber::EnvFilter;
@@ -261,8 +264,25 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Trace {
             action: TraceAction::Inspect { tape, public_key },
         } => {
-            GatewayEngine::verify_tape_with_key(&tape, public_key.as_deref())?;
             let verification = GatewayEngine::inspect_tape(&tape, |r| {
+                if let Some(ref vk) = public_key {
+                    let sig_hex = r
+                        .provenance
+                        .as_ref()
+                        .and_then(|p| p.get("signature_hex"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            keelway_engine::core::KeelwayError::Tape(format!(
+                                "missing Ed25519 provenance signature at seq {}",
+                                r.seq
+                            ))
+                        })?;
+                    keelway_engine::provenance::TapeSigner::verify_hex(
+                        vk,
+                        r.entry_hash.as_bytes(),
+                        sig_hex,
+                    )?;
+                }
                 let badge = match r.decision {
                     Decision::Allow => "ALLOWED",
                     Decision::Deny => "BLOCKED",
@@ -354,12 +374,12 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&path, format!("{seed_hex}\n"))?;
+                let mut opts = fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true);
                 #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-                }
+                opts.mode(0o600);
+                let mut file = opts.open(&path)?;
+                writeln!(file, "{seed_hex}")?;
                 println!("Generated Ed25519 signing key:");
                 println!("  key_id:        {key_id}");
                 println!("  verifying_key: {verifying_key_hex}");
