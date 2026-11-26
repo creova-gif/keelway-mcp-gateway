@@ -2539,3 +2539,151 @@ permit(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn concurrent_mixed_principals_preserve_tape_chain_and_budget_isolation()
+-> Result<(), KeelwayError> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db_url = spawn_mock_mcp_server(None, calls.clone()).await?;
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("concurrent-mixed-principals-tape.jsonl");
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        approval_required: vec![],
+        budgets: vec![BudgetRule {
+            org_id: "acme".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            server: "database".to_owned(),
+            max_calls_per_minute: Some(8),
+            max_concurrent_calls: None,
+        }],
+        principals: vec![
+            PrincipalConfig {
+                org_id: "acme".to_owned(),
+                agent_id: "agent-a".to_owned(),
+                roles: vec!["researcher".to_owned()],
+                token_ref: Some("tok-a".to_owned()),
+            },
+            PrincipalConfig {
+                org_id: "acme".to_owned(),
+                agent_id: "agent-b".to_owned(),
+                roles: vec!["researcher".to_owned()],
+                token_ref: Some("tok-b".to_owned()),
+            },
+        ],
+        servers: vec![ServerConfig {
+            alias: "database".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["query_readonly".to_owned()],
+            resources: vec![],
+            prompts: vec![],
+            transport: UpstreamTransport::StreamableHttp {
+                url: db_url,
+                headers: BTreeMap::new(),
+            },
+        }],
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"researcher",
+    action == Action::"call_tool",
+    resource == Tool::"database/query_readonly"
+);
+"#;
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(HashMap::new()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+    let barrier = Arc::new(tokio::sync::Barrier::new(20));
+    let mut handles = Vec::with_capacity(20);
+
+    for i in 0..20usize {
+        let (principal, token) = if i % 2 == 0 {
+            ("agent-a", "tok-a")
+        } else {
+            ("agent-b", "tok-b")
+        };
+        let client = client.clone();
+        let gw_url = gw_url.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let resp: Value = client
+                .post(&gw_url)
+                .header("authorization", format!("Bearer {token}"))
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": i + 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "database__query_readonly",
+                        "arguments": { "sql": "SELECT 1" }
+                    }
+                }))
+                .send()
+                .await
+                .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+                .json()
+                .await
+                .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+            Ok::<(&'static str, Value), KeelwayError>((principal, resp))
+        }));
+    }
+
+    let mut a_allowed = 0usize;
+    let mut a_budget_exceeded = 0usize;
+    let mut b_allowed = 0usize;
+
+    for handle in handles {
+        let (principal, resp) = handle
+            .await
+            .map_err(|e| KeelwayError::Mcp(format!("join error: {e}")))??;
+        match principal {
+            "agent-a" => {
+                if resp.get("result").is_some() {
+                    a_allowed += 1;
+                } else if resp["error"]["code"] == -32004
+                    && resp["error"]["message"] == "BudgetExceeded"
+                {
+                    a_budget_exceeded += 1;
+                } else {
+                    return Err(KeelwayError::Mcp(format!(
+                        "unexpected agent-a response: {resp}"
+                    )));
+                }
+            }
+            "agent-b" => {
+                if resp.get("result").is_some() {
+                    b_allowed += 1;
+                } else {
+                    return Err(KeelwayError::Mcp(format!(
+                        "unexpected agent-b response: {resp}"
+                    )));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    assert_eq!(a_allowed, 8);
+    assert_eq!(a_budget_exceeded, 2);
+    assert_eq!(b_allowed, 10);
+    assert_eq!(calls.load(Ordering::SeqCst), 18);
+
+    let verified = GatewayEngine::verify_tape(&tape_path)?;
+    assert!(verified.valid);
+    assert_eq!(verified.count, 20);
+
+    Ok(())
+}
