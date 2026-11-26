@@ -4,7 +4,7 @@ use crate::core::{
     ServerConfig, ToolCall, UnsealedReceipt, UpstreamTransport, sanitize_federated_name,
     validate_server_alias,
 };
-use crate::metrics::{GatewayMetrics, LiveConsoleEvent};
+use crate::metrics::{EventOutcome, GatewayMetrics, LiveConsoleEvent};
 use crate::p10::P10GateManager;
 use crate::policy::PolicyEngine;
 use crate::secrets::{SecretProvider, SecretScrubber};
@@ -509,67 +509,52 @@ impl GatewayRuntime {
                     vo.reason = self.scrubber.scrub_str(&vo.reason);
                 }
 
-                let p10_timeout_ms = if eval.decision == Decision::Allow {
-                    self.p10.requires_approval(
-                        principal,
-                        &tool_meta.server_alias,
-                        &tool_meta.upstream_name,
-                    )
-                } else {
-                    None
-                };
-
-                let state = match (eval.decision, p10_timeout_ms) {
-                    (Decision::Allow, Some(_)) => ReceiptState::Awaiting,
-                    (Decision::Allow, None) => ReceiptState::Sealed,
-                    (Decision::Deny, _) => ReceiptState::Blocked,
-                };
-
-                let unsealed = UnsealedReceipt {
-                    timestamp: Utc::now(),
-                    org_id: principal.org_id.clone(),
-                    agent_id: principal.agent_id.clone(),
-                    server: tool_meta.server_alias.clone(),
-                    tool: tool_meta.upstream_name.clone(),
-                    redacted_args: redacted_args.clone(),
-                    redacted_fields: redacted_fields.clone(),
-                    decision: eval.decision,
-                    explanation: scrubbed_explanation.clone(),
-                    policy_digest: scrubbed_explanation.policy_digest.clone(),
-                    state,
-                    outcome: None,
-                    provenance: None,
-                };
-
-                // Fail-closed: receipt MUST persist before dispatching any upstream side effect
-                if let Err(e) = self.tape.append(unsealed).await {
-                    return jsonrpc_error(
-                        id,
-                        JSONRPC_TAPE_PERSISTENCE_ERR,
-                        &format!("TapePersistenceError (fail-closed): {e}"),
-                        None,
-                    );
-                }
-
-                self.metrics.record_event(LiveConsoleEvent {
-                    timestamp: Utc::now(),
-                    org_id: principal.org_id.clone(),
-                    agent_id: principal.agent_id.clone(),
-                    server: tool_meta.server_alias.clone(),
-                    tool: tool_meta.upstream_name.clone(),
-                    decision: eval.decision,
-                    state,
-                    reason: scrubbed_explanation.reason.clone(),
-                });
-
-                self.emit_console_line(
-                    &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
-                    &principal.agent_id,
-                    eval.decision,
-                    &scrubbed_explanation.reason,
-                );
-
                 if eval.decision == Decision::Deny {
+                    let unsealed = UnsealedReceipt {
+                        timestamp: Utc::now(),
+                        org_id: principal.org_id.clone(),
+                        agent_id: principal.agent_id.clone(),
+                        server: tool_meta.server_alias.clone(),
+                        tool: tool_meta.upstream_name.clone(),
+                        redacted_args,
+                        redacted_fields,
+                        decision: eval.decision,
+                        explanation: scrubbed_explanation.clone(),
+                        policy_digest: scrubbed_explanation.policy_digest.clone(),
+                        state: ReceiptState::Blocked,
+                        outcome: None,
+                        provenance: None,
+                    };
+
+                    // Fail-closed: receipt MUST persist before returning decision
+                    if let Err(e) = self.tape.append(unsealed).await {
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_TAPE_PERSISTENCE_ERR,
+                            &format!("TapePersistenceError (fail-closed): {e}"),
+                            None,
+                        );
+                    }
+
+                    self.metrics.record_event(LiveConsoleEvent {
+                        timestamp: Utc::now(),
+                        org_id: principal.org_id.clone(),
+                        agent_id: principal.agent_id.clone(),
+                        server: tool_meta.server_alias.clone(),
+                        tool: tool_meta.upstream_name.clone(),
+                        decision: eval.decision,
+                        state: ReceiptState::Blocked,
+                        outcome: EventOutcome::DeniedPolicy,
+                        reason: scrubbed_explanation.reason.clone(),
+                    });
+
+                    self.emit_console_line(
+                        &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
+                        &principal.agent_id,
+                        eval.decision,
+                        &scrubbed_explanation.reason,
+                    );
+
                     return jsonrpc_error(
                         id,
                         JSONRPC_POLICY_DENIED,
@@ -608,7 +593,17 @@ impl GatewayRuntime {
                                 provenance: None,
                             })
                             .await;
-                        self.metrics.inc_calls_denied_budget();
+                        self.metrics.record_event(LiveConsoleEvent {
+                            timestamp: Utc::now(),
+                            org_id: principal.org_id.clone(),
+                            agent_id: principal.agent_id.clone(),
+                            server: tool_meta.server_alias.clone(),
+                            tool: tool_meta.upstream_name.clone(),
+                            decision: Decision::Deny,
+                            state: ReceiptState::Blocked,
+                            outcome: EventOutcome::DeniedBudget,
+                            reason: reason.clone(),
+                        });
                         self.emit_console_line(
                             &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
                             &principal.agent_id,
@@ -624,6 +619,62 @@ impl GatewayRuntime {
                     }
                 };
 
+                let p10_timeout_ms = self.p10.requires_approval(
+                    principal,
+                    &tool_meta.server_alias,
+                    &tool_meta.upstream_name,
+                );
+
+                let (state, initial_outcome) = match p10_timeout_ms {
+                    Some(_) => (ReceiptState::Awaiting, EventOutcome::P10Awaiting),
+                    None => (ReceiptState::Sealed, EventOutcome::Allowed),
+                };
+
+                let unsealed = UnsealedReceipt {
+                    timestamp: Utc::now(),
+                    org_id: principal.org_id.clone(),
+                    agent_id: principal.agent_id.clone(),
+                    server: tool_meta.server_alias.clone(),
+                    tool: tool_meta.upstream_name.clone(),
+                    redacted_args: redacted_args.clone(),
+                    redacted_fields: redacted_fields.clone(),
+                    decision: eval.decision,
+                    explanation: scrubbed_explanation.clone(),
+                    policy_digest: scrubbed_explanation.policy_digest.clone(),
+                    state,
+                    outcome: None,
+                    provenance: None,
+                };
+
+                // Fail-closed: receipt MUST persist before dispatching any upstream side effect
+                if let Err(e) = self.tape.append(unsealed).await {
+                    return jsonrpc_error(
+                        id,
+                        JSONRPC_TAPE_PERSISTENCE_ERR,
+                        &format!("TapePersistenceError (fail-closed): {e}"),
+                        None,
+                    );
+                }
+
+                self.metrics.record_event(LiveConsoleEvent {
+                    timestamp: Utc::now(),
+                    org_id: principal.org_id.clone(),
+                    agent_id: principal.agent_id.clone(),
+                    server: tool_meta.server_alias.clone(),
+                    tool: tool_meta.upstream_name.clone(),
+                    decision: eval.decision,
+                    state,
+                    outcome: initial_outcome,
+                    reason: scrubbed_explanation.reason.clone(),
+                });
+
+                self.emit_console_line(
+                    &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
+                    &principal.agent_id,
+                    eval.decision,
+                    &scrubbed_explanation.reason,
+                );
+
                 // Enforce P-10 human-in-the-loop approval gate if configured (ADR-004).
                 if let Some(timeout_ms) = p10_timeout_ms {
                     let (approval_id, rx) = self.p10.create_gate(
@@ -632,8 +683,10 @@ impl GatewayRuntime {
                         &tool_meta.upstream_name,
                         redacted_args.clone(),
                     );
+                    let mut gate_guard = self.p10.guard(&approval_id);
                     let wait_res =
                         tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await;
+                    gate_guard.disarm();
                     let approved = match wait_res {
                         Ok(Ok(true)) => true,
                         Ok(Ok(false)) | Ok(Err(_)) => false,
@@ -643,7 +696,6 @@ impl GatewayRuntime {
                         }
                     };
                     if !approved {
-                        self.metrics.inc_calls_p10_denied();
                         let deny_reason = format!(
                             "P-10 human approval denied or timed out (gate_id: {approval_id})"
                         );
@@ -672,6 +724,17 @@ impl GatewayRuntime {
                                 provenance: None,
                             })
                             .await;
+                        self.metrics.record_event(LiveConsoleEvent {
+                            timestamp: Utc::now(),
+                            org_id: principal.org_id.clone(),
+                            agent_id: principal.agent_id.clone(),
+                            server: tool_meta.server_alias.clone(),
+                            tool: tool_meta.upstream_name.clone(),
+                            decision: Decision::Deny,
+                            state: ReceiptState::Blocked,
+                            outcome: EventOutcome::P10Denied,
+                            reason: deny_reason,
+                        });
                         return jsonrpc_error(
                             id,
                             JSONRPC_APPROVAL_DENIED,
@@ -679,12 +742,66 @@ impl GatewayRuntime {
                             Some(serde_json::to_value(&deny_expl).unwrap_or(Value::Null)),
                         );
                     }
-                    self.metrics.inc_calls_p10_approved();
+
+                    // Re-evaluate policy after P-10 approval in case hot reload revoked access while waiting.
+                    match self.policy.evaluate(principal, &tool_call) {
+                        Ok(re_eval) if re_eval.decision == Decision::Deny => {
+                            let mut re_expl = re_eval.explanation;
+                            re_expl.reason = self.scrubber.scrub_str(&re_expl.reason);
+                            let _ = self
+                                .tape
+                                .append(UnsealedReceipt {
+                                    timestamp: Utc::now(),
+                                    org_id: principal.org_id.clone(),
+                                    agent_id: principal.agent_id.clone(),
+                                    server: tool_meta.server_alias.clone(),
+                                    tool: tool_meta.upstream_name.clone(),
+                                    redacted_args,
+                                    redacted_fields,
+                                    decision: Decision::Deny,
+                                    explanation: re_expl.clone(),
+                                    policy_digest: re_expl.policy_digest.clone(),
+                                    state: ReceiptState::Blocked,
+                                    outcome: None,
+                                    provenance: None,
+                                })
+                                .await;
+                            self.metrics.record_event(LiveConsoleEvent {
+                                timestamp: Utc::now(),
+                                org_id: principal.org_id.clone(),
+                                agent_id: principal.agent_id.clone(),
+                                server: tool_meta.server_alias.clone(),
+                                tool: tool_meta.upstream_name.clone(),
+                                decision: Decision::Deny,
+                                state: ReceiptState::Blocked,
+                                outcome: EventOutcome::DeniedPolicy,
+                                reason: re_expl.reason.clone(),
+                            });
+                            return jsonrpc_error(
+                                id,
+                                JSONRPC_POLICY_DENIED,
+                                "PolicyDenied",
+                                Some(serde_json::to_value(&re_expl).unwrap_or(Value::Null)),
+                            );
+                        }
+                        Err(e) => {
+                            return jsonrpc_error(
+                                id,
+                                JSONRPC_POLICY_DENIED,
+                                &format!("PolicyEvaluationError (fail-closed): {e}"),
+                                None,
+                            );
+                        }
+                        Ok(_) => {}
+                    }
+
+                    let approve_reason =
+                        format!("P-10 human approval granted (gate_id: {approval_id})");
                     let seal_expl = Explanation {
                         decision: Decision::Allow,
                         rule_ids: vec!["p10_gate".to_owned()],
                         validator_outcomes: vec![],
-                        reason: format!("P-10 human approval granted (gate_id: {approval_id})"),
+                        reason: approve_reason.clone(),
                         policy_digest: scrubbed_explanation.policy_digest.clone(),
                     };
                     if let Err(e) = self
@@ -713,6 +830,17 @@ impl GatewayRuntime {
                             None,
                         );
                     }
+                    self.metrics.record_event(LiveConsoleEvent {
+                        timestamp: Utc::now(),
+                        org_id: principal.org_id.clone(),
+                        agent_id: principal.agent_id.clone(),
+                        server: tool_meta.server_alias.clone(),
+                        tool: tool_meta.upstream_name.clone(),
+                        decision: Decision::Allow,
+                        state: ReceiptState::Sealed,
+                        outcome: EventOutcome::P10Approved,
+                        reason: approve_reason,
+                    });
                 }
 
                 // Dispatch to upstream MCP server
@@ -870,32 +998,45 @@ async fn events_sse_handler(
     headers: HeaderMap,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if runtime.authenticate_bearer(auth_header).is_none() {
+    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthenticated" })),
         )
             .into_response();
-    }
+    };
+    let org_id = principal.org_id.clone();
     let rx_owned = runtime.metrics.subscribe();
-    let sse_stream = futures_util::stream::unfold(rx_owned, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let payload = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
-                    return Some((
-                        Ok::<Event, std::convert::Infallible>(Event::default().data(payload)),
-                        rx,
-                    ));
+    let sse_stream =
+        futures_util::stream::unfold((rx_owned, org_id), |(mut rx, org_id)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if ev.org_id != org_id {
+                            continue;
+                        }
+                        let payload =
+                            serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                        return Some((
+                            Ok::<Event, std::convert::Infallible>(Event::default().data(payload)),
+                            (rx, org_id),
+                        ));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    });
+        });
     Sse::new(sse_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+fn has_p10_approver_role(principal: &Principal) -> bool {
+    principal
+        .roles
+        .iter()
+        .any(|r| r == "p10-approver" || r == "admin")
 }
 
 async fn p10_pending_handler(
@@ -910,6 +1051,13 @@ async fn p10_pending_handler(
         )
             .into_response();
     };
+    if !has_p10_approver_role(&principal) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "p10-approver or admin role required" })),
+        )
+            .into_response();
+    }
     let pending: Vec<_> = runtime
         .p10
         .list_pending()
@@ -931,15 +1079,28 @@ async fn p10_resolve_handler(
     Json(body): Json<P10ResolveBody>,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if runtime.authenticate_bearer(auth_header).is_none() {
+    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthenticated" })),
         )
             .into_response();
+    };
+    if !has_p10_approver_role(&principal) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "p10-approver or admin role required" })),
+        )
+            .into_response();
     }
-    match runtime.p10.resolve(&body.approval_id, body.approved) {
+    match runtime
+        .p10
+        .resolve(&body.approval_id, &principal.org_id, body.approved)
+    {
         Ok(()) => (StatusCode::OK, Json(json!({ "resolved": true }))).into_response(),
+        Err(KeelwayError::Auth(msg)) => {
+            (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
+        }
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": e.to_string() })),
