@@ -203,6 +203,7 @@ async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Res
                 },
             },
         ],
+        ..Default::default()
     };
 
     let mut secret_map = HashMap::new();
@@ -403,6 +404,7 @@ async fn stdio_upstream_federation_injects_env_and_scrubs_stdout_and_stderr()
             },
         }],
         validators: vec![],
+        ..Default::default()
     };
 
     let mut secret_map = HashMap::new();
@@ -494,6 +496,7 @@ async fn stdio_upstream_timeout_returns_32002_and_records_timeout_receipt()
             },
         }],
         validators: vec![],
+        ..Default::default()
     };
 
     let provider = MapSecrets(HashMap::new());
@@ -576,6 +579,7 @@ async fn stdio_upstream_crash_returns_32003_and_records_crashed_receipt() -> Res
             },
         }],
         validators: vec![],
+        ..Default::default()
     };
 
     let provider = MapSecrets(HashMap::new());
@@ -803,6 +807,7 @@ async fn execution_budget_blocks_excess_calls_with_32004_and_records_deny_receip
             arg_name: "sql".to_owned(),
             kind: ValidatorKind::SqlReadonly,
         }],
+        ..Default::default()
     };
 
     let budget_cedar = r#"
@@ -906,6 +911,7 @@ async fn stdio_child_env_clear_isolates_inherited_host_secrets() -> Result<(), K
             },
         }],
         validators: vec![],
+        ..Default::default()
     };
 
     let cedar = r#"
@@ -1003,6 +1009,7 @@ async fn p10_human_gate_and_observability_endpoints_work_end_to_end() -> Result<
             arg_name: "sql".to_owned(),
             kind: ValidatorKind::SqlReadonly,
         }],
+        ..Default::default()
     };
 
     let p10_cedar = r#"
@@ -1133,5 +1140,147 @@ permit(
     let verified = GatewayEngine::verify_tape(&tape_path)?;
     assert!(verified.valid);
     assert_eq!(verified.count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn payload_size_guardrails_block_oversized_requests_and_responses() -> Result<(), KeelwayError>
+{
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/mcp",
+            post(
+                move |State(counter): State<Arc<AtomicUsize>>, Json(body): Json<Value>| async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mode = body["params"]["arguments"]["mode"]
+                        .as_str()
+                        .unwrap_or("small");
+                    let text = if mode == "large" {
+                        "x".repeat(256)
+                    } else {
+                        "ok".to_owned()
+                    };
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": body.get("id").cloned().unwrap_or(Value::Null),
+                        "result": {
+                            "content": [{ "type": "text", "text": text }]
+                        }
+                    }))
+                },
+            ),
+        )
+        .with_state(calls.clone());
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, app).await;
+    });
+    let upstream_url = format!("http://{upstream_addr}/mcp");
+
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-tape.jsonl");
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        max_request_bytes: 64,
+        max_response_bytes: 128,
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-size".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "echo".to_owned(),
+            transport: UpstreamTransport::StreamableHttp {
+                url: upstream_url,
+                headers: BTreeMap::new(),
+            },
+            timeout_ms: 5_000,
+            tools: vec!["ping".to_owned()],
+        }],
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"echo/ping"
+);
+"#;
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(HashMap::new()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    // 1. Oversized request arguments (> 64 bytes) rejected with -32006 before reaching upstream
+    let oversized_arg = "a".repeat(128);
+    let req_too_large: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-size")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "echo__ping", "arguments": { "payload": oversized_arg } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(req_too_large["error"]["code"], -32006);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    // 2. Small request + small response succeeds
+    let small_ok: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-size")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "echo__ping", "arguments": { "mode": "small" } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(small_ok["result"]["content"][0]["text"], "ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // 3. Small request + oversized upstream response (> 128 bytes) rejected with -32006
+    let resp_too_large: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-size")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "echo__ping", "arguments": { "mode": "large" } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(resp_too_large["error"]["code"], -32006);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
     Ok(())
 }

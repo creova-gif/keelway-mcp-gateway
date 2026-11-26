@@ -3,12 +3,24 @@ use aho_corasick::AhoCorasick;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use regex::Regex;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fs;
+use std::sync::LazyLock;
 
 const MIN_SECRET_LEN: usize = 8;
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+static AWS_ACCESS_KEY_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").ok());
+static GITHUB_TOKEN_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b").ok());
+static PEM_PRIVATE_KEY_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----")
+        .ok()
+});
 
 /// Pluggable secret resolution trait (env, file, future GCP Secret Manager + OIDC).
 pub trait SecretProvider: Send + Sync {
@@ -55,11 +67,13 @@ impl SecretProvider for DefaultSecretProvider {
 }
 
 /// In-memory Aho-Corasick scrubber for gateway-managed secrets (>= 8 bytes)
-/// across raw, JSON-escaped, URL-encoded, and Base64 wire encodings.
+/// across raw, JSON-escaped, URL-encoded, and Base64 wire encodings, with
+/// optional built-in egress credential pattern scrubbing.
 #[derive(Debug, Clone)]
 pub struct SecretScrubber {
     automaton: Option<AhoCorasick>,
     max_pattern_len: usize,
+    pattern_scrubbing: bool,
 }
 
 impl SecretScrubber {
@@ -104,6 +118,7 @@ impl SecretScrubber {
             return Ok(Self {
                 automaton: None,
                 max_pattern_len: 0,
+                pattern_scrubbing: true,
             });
         }
 
@@ -115,6 +130,7 @@ impl SecretScrubber {
         Ok(Self {
             automaton: Some(automaton),
             max_pattern_len,
+            pattern_scrubbing: true,
         })
     }
 
@@ -122,26 +138,52 @@ impl SecretScrubber {
         Self {
             automaton: None,
             max_pattern_len: 0,
+            pattern_scrubbing: true,
         }
+    }
+
+    /// Enables or disables built-in egress credential pattern scrubbing.
+    pub fn with_pattern_scrubbing(mut self, enabled: bool) -> Self {
+        self.pattern_scrubbing = enabled;
+        self
     }
 
     pub fn max_pattern_len(&self) -> usize {
         self.max_pattern_len
     }
 
-    /// Scrubs all registered secret patterns from `input`.
+    /// Scrubs all registered secret patterns (and optional built-in credential patterns) from `input`.
     pub fn scrub_str(&self, input: &str) -> String {
-        let Some(ac) = &self.automaton else {
-            return input.to_owned();
+        let mut out = match &self.automaton {
+            Some(ac) => {
+                let mut buf = String::with_capacity(input.len());
+                let mut last = 0usize;
+                for m in ac.find_iter(input) {
+                    buf.push_str(&input[last..m.start()]);
+                    buf.push_str(REDACTED_PLACEHOLDER);
+                    last = m.end();
+                }
+                buf.push_str(&input[last..]);
+                buf
+            }
+            None => input.to_owned(),
         };
-        let mut out = String::with_capacity(input.len());
-        let mut last = 0usize;
-        for m in ac.find_iter(input) {
-            out.push_str(&input[last..m.start()]);
-            out.push_str(REDACTED_PLACEHOLDER);
-            last = m.end();
+
+        if self.pattern_scrubbing {
+            for re in [
+                AWS_ACCESS_KEY_RE.as_ref(),
+                GITHUB_TOKEN_RE.as_ref(),
+                PEM_PRIVATE_KEY_RE.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Cow::Owned(replaced) = re.replace_all(&out, REDACTED_PLACEHOLDER) {
+                    out = replaced;
+                }
+            }
         }
-        out.push_str(&input[last..]);
+
         out
     }
 
@@ -293,6 +335,66 @@ mod tests {
         assert_eq!(fields, vec!["/nested/token".to_owned()]);
         assert_eq!(scrubbed["nested"]["token"], "Bearer [REDACTED]");
         assert_eq!(scrubbed["repo"], "sorvex/keelway");
+        Ok(())
+    }
+
+    #[test]
+    fn scrubs_unregistered_aws_access_key_id() {
+        let scrubber = SecretScrubber::empty();
+        let key = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let input = format!("aws_key={key} short=AKIA123");
+        let out = scrubber.scrub_str(&input);
+        assert!(!out.contains(key));
+        assert_eq!(out, "aws_key=[REDACTED] short=AKIA123");
+    }
+
+    #[test]
+    fn scrubs_unregistered_github_tokens_in_text_and_json() {
+        let scrubber = SecretScrubber::empty();
+        let pat = concat!("ghp_", "0123456789abcdef0123456789abcdef0123");
+        let oauth = concat!("gho_", "abcdefghijklmnopqrstuvwxyz012345");
+        let payload = json!({
+            "auth": format!("token {pat}"),
+            "secondary": oauth,
+        });
+        let (scrubbed, fields) = scrubber.scrub_json(&payload);
+        assert_eq!(scrubbed["auth"], "token [REDACTED]");
+        assert_eq!(scrubbed["secondary"], "[REDACTED]");
+        assert_eq!(fields, vec!["/auth".to_owned(), "/secondary".to_owned()]);
+    }
+
+    #[test]
+    fn scrubs_unregistered_pem_private_key() {
+        let scrubber = SecretScrubber::empty();
+        let pem = concat!(
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nMIIEowIBAAKCAQEAtest\n-----END RSA ",
+            "PRIVATE KEY-----"
+        );
+        let input = format!("prefix\n{pem}\nsuffix");
+        let out = scrubber.scrub_str(&input);
+        assert!(!out.contains("BEGIN RSA"));
+        assert!(!out.contains("MIIEowIBAAKCAQEAtest"));
+        assert_eq!(out, "prefix\n[REDACTED]\nsuffix");
+    }
+
+    #[test]
+    fn with_pattern_scrubbing_false_disables_builtin_patterns() -> Result<(), KeelwayError> {
+        let registered = "registered_secret_value_123";
+        let scrubber = SecretScrubber::new([registered])?.with_pattern_scrubbing(false);
+        let aws_key = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let gh_token = concat!("ghp_", "0123456789abcdef0123456789abcdef0123");
+        let pem = concat!(
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nabc\n-----END RSA ",
+            "PRIVATE KEY-----"
+        );
+        let input = format!("{registered} {aws_key} {gh_token} {pem}");
+        let out = scrubber.scrub_str(&input);
+        assert!(!out.contains(registered));
+        assert!(out.contains(aws_key));
+        assert!(out.contains(gh_token));
+        assert!(out.contains(pem));
         Ok(())
     }
 }

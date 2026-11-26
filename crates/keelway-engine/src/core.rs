@@ -177,6 +177,12 @@ pub struct GatewayConfig {
     pub budgets: Vec<BudgetRule>,
     #[serde(default)]
     pub approval_required: Vec<ApprovalRule>,
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default = "default_egress_pattern_scrubbing")]
+    pub egress_pattern_scrubbing: bool,
 }
 
 impl Default for GatewayConfig {
@@ -190,6 +196,9 @@ impl Default for GatewayConfig {
             validators: Vec::new(),
             budgets: Vec::new(),
             approval_required: Vec::new(),
+            max_request_bytes: default_max_request_bytes(),
+            max_response_bytes: default_max_response_bytes(),
+            egress_pattern_scrubbing: default_egress_pattern_scrubbing(),
         }
     }
 }
@@ -240,6 +249,18 @@ fn default_bind_addr() -> String {
 
 fn default_tape_path() -> PathBuf {
     PathBuf::from("keelway-tape.jsonl")
+}
+
+fn default_max_request_bytes() -> usize {
+    1_048_576
+}
+
+fn default_max_response_bytes() -> usize {
+    4_194_304
+}
+
+fn default_egress_pattern_scrubbing() -> bool {
+    true
 }
 
 /// Configured principal and authentication token binding.

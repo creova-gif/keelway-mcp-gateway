@@ -34,6 +34,7 @@ pub const JSONRPC_UPSTREAM_TIMEOUT: i64 = -32002;
 pub const JSONRPC_UPSTREAM_UNAVAILABLE: i64 = -32003;
 pub const JSONRPC_BUDGET_EXCEEDED: i64 = -32004;
 pub const JSONRPC_APPROVAL_DENIED: i64 = -32005;
+pub const JSONRPC_PAYLOAD_TOO_LARGE: i64 = -32006;
 
 /// Metadata for a federated upstream MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +359,8 @@ pub struct GatewayRuntime {
     token_map: HashMap<String, Principal>,
     upstreams: HashMap<String, UpstreamDriver>,
     console_to_stderr: bool,
+    max_request_bytes: usize,
+    max_response_bytes: usize,
 }
 
 impl GatewayRuntime {
@@ -402,7 +405,10 @@ impl GatewayRuntime {
         }
 
         let registry = ToolRegistry::build(federated_tools)?;
-        let scrubber = Arc::new(SecretScrubber::new(&collected_secrets)?);
+        let scrubber = Arc::new(
+            SecretScrubber::new(&collected_secrets)?
+                .with_pattern_scrubbing(config.egress_pattern_scrubbing),
+        );
         let budgets = BudgetTracker::new(config.budgets.clone());
         let p10 = P10GateManager::new(config.approval_required.clone());
         let metrics = Arc::new(GatewayMetrics::new());
@@ -418,6 +424,8 @@ impl GatewayRuntime {
             token_map,
             upstreams,
             console_to_stderr,
+            max_request_bytes: config.max_request_bytes,
+            max_response_bytes: config.max_response_bytes,
         })
     }
 
@@ -474,6 +482,21 @@ impl GatewayRuntime {
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
+
+                let req_bytes = serde_json::to_vec(&arguments)
+                    .map(|v| v.len())
+                    .unwrap_or(usize::MAX);
+                if req_bytes > self.max_request_bytes {
+                    return jsonrpc_error(
+                        id,
+                        JSONRPC_PAYLOAD_TOO_LARGE,
+                        &format!(
+                            "PayloadTooLarge: request arguments ({req_bytes} bytes) exceed max_request_bytes ({})",
+                            self.max_request_bytes
+                        ),
+                        None,
+                    );
+                }
 
                 let Some(tool_meta) = self.registry.resolve(fed_name) else {
                     return jsonrpc_error(
@@ -868,11 +891,27 @@ impl GatewayRuntime {
                     .call_tool(&tool_meta.upstream_name, &arguments, &self.scrubber)
                     .await
                 {
-                    Ok(result) => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": result
-                    }),
+                    Ok(result) => {
+                        let resp_bytes = serde_json::to_vec(&result)
+                            .map(|v| v.len())
+                            .unwrap_or(usize::MAX);
+                        if resp_bytes > self.max_response_bytes {
+                            return jsonrpc_error(
+                                id,
+                                JSONRPC_PAYLOAD_TOO_LARGE,
+                                &format!(
+                                    "PayloadTooLarge: upstream response ({resp_bytes} bytes) exceed max_response_bytes ({})",
+                                    self.max_response_bytes
+                                ),
+                                None,
+                            );
+                        }
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": result
+                        })
+                    }
                     Err(KeelwayError::UpstreamTimeout(ms)) => {
                         self.metrics.inc_upstream_timeout();
                         let _ = self

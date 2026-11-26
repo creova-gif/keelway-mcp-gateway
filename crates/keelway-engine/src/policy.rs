@@ -800,6 +800,7 @@ mod tests {
                     },
                 },
             ],
+            ..Default::default()
         }
     }
 
