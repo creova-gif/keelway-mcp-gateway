@@ -61,6 +61,7 @@
 
     button:focus-visible,
     input:focus-visible,
+    select:focus-visible,
     .skip-link:focus-visible,
     [tabindex]:focus-visible {
       outline: 2px solid #60a5fa;
@@ -139,7 +140,9 @@
     }
 
     input[type="password"],
-    input[type="text"] {
+    input[type="text"],
+    input[type="search"],
+    select {
       background: var(--bg);
       color: var(--text);
       border: 1px solid var(--border);
@@ -151,11 +154,13 @@
       max-width: 100%;
     }
 
-    input:focus {
+    input:focus,
+    select:focus {
       border-color: var(--accent);
     }
 
-    input:focus:not(:focus-visible) {
+    input:focus:not(:focus-visible),
+    select:focus:not(:focus-visible) {
       outline: none;
     }
 
@@ -386,6 +391,44 @@
       justify-content: flex-end;
     }
 
+    .stream-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .stream-toolbar select {
+      width: auto;
+      min-width: 140px;
+      font-family: var(--sans);
+      cursor: pointer;
+    }
+
+    .stream-toolbar input[type="search"] {
+      flex: 1 1 180px;
+      width: auto;
+      min-width: 0;
+    }
+
+    .stream-toolbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button[aria-pressed="true"] {
+      background: var(--warn-bg);
+      border-color: rgba(245, 158, 11, 0.45);
+      color: var(--warn);
+    }
+
+    button[aria-pressed="true"]:hover:not(:disabled) {
+      background: rgba(245, 158, 11, 0.24);
+    }
+
     .stream-list {
       display: flex;
       flex-direction: column;
@@ -507,9 +550,19 @@
       <section class="panel" aria-labelledby="stream-heading">
         <div class="section-header">
           <h2 id="stream-heading" class="section-title">Live Decision Stream</h2>
-          <div class="auth-controls">
-            <span id="stream-status" class="section-meta" aria-live="polite">Idle</span>
-            <button id="clear-stream-btn" type="button">Clear</button>
+          <span id="stream-status" class="section-meta" aria-live="polite">Idle</span>
+        </div>
+        <div class="stream-toolbar" role="region" aria-label="Stream triage controls">
+          <select id="stream-filter" aria-label="Filter stream by outcome">
+            <option value="all">All outcomes</option>
+            <option value="allowed">Allowed</option>
+            <option value="denied">Denied / Blocked</option>
+            <option value="p10">P-10 Gate</option>
+          </select>
+          <input id="stream-search" type="search" placeholder="Filter by server, tool, or agent..." aria-label="Search decision stream">
+          <div class="stream-toolbar-actions">
+            <button id="stream-pause-btn" type="button" aria-pressed="false">Pause</button>
+            <button id="stream-clear-btn" type="button">Clear</button>
           </div>
         </div>
         <div id="stream-notice" class="notice" aria-live="polite" hidden></div>
@@ -556,9 +609,12 @@
         p10Notice: document.getElementById('p10-notice'),
         p10List: document.getElementById('p10-list'),
         streamStatus: document.getElementById('stream-status'),
+        streamFilter: document.getElementById('stream-filter'),
+        streamSearch: document.getElementById('stream-search'),
+        streamPauseBtn: document.getElementById('stream-pause-btn'),
+        streamClearBtn: document.getElementById('stream-clear-btn'),
         streamNotice: document.getElementById('stream-notice'),
-        streamList: document.getElementById('stream-list'),
-        clearStreamBtn: document.getElementById('clear-stream-btn')
+        streamList: document.getElementById('stream-list')
       };
 
       var metricValueEls = {};
@@ -567,6 +623,9 @@
       var sseAbortController = null;
       var sseReconnectTimer = null;
       var inFlightApprovals = new Set();
+      var streamEvents = [];
+      var streamPaused = false;
+      var baseStreamStatus = 'Idle';
 
       function initMetricCards() {
         for (var i = 0; i < METRIC_DEFS.length; i++) {
@@ -866,11 +925,46 @@
         return 'err';
       }
 
-      function appendStreamEvent(ev) {
-        if (els.streamList.firstChild && els.streamList.firstChild.classList && els.streamList.firstChild.classList.contains('empty')) {
-          clearChildren(els.streamList);
+      function setStreamStatus(text) {
+        baseStreamStatus = text;
+        els.streamStatus.textContent = streamPaused ? (baseStreamStatus + ' (Paused)') : baseStreamStatus;
+      }
+
+      function matchesStreamFilter(ev, filterVal, query) {
+        var outcome = String(ev && ev.outcome || '').toLowerCase();
+        if (filterVal === 'allowed') {
+          if (outcome !== 'allowed') {
+            return false;
+          }
+        } else if (filterVal === 'denied') {
+          if (outcome.indexOf('denied') === -1 && outcome.indexOf('blocked') === -1) {
+            return false;
+          }
+        } else if (filterVal === 'p10') {
+          if (outcome.indexOf('p10') !== 0) {
+            return false;
+          }
         }
 
+        var q = String(query || '').trim().toLowerCase();
+        if (q !== '') {
+          var haystack = [
+            ev && ev.server,
+            ev && ev.tool,
+            ev && ev.org_id,
+            ev && ev.agent_id,
+            ev && ev.outcome,
+            ev && ev.state,
+            ev && ev.reason
+          ].map(function (v) { return String(v || ''); }).join(' ').toLowerCase();
+          if (haystack.indexOf(q) === -1) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function buildStreamRow(ev) {
         var row = document.createElement('div');
         row.className = 'event-row';
 
@@ -911,11 +1005,52 @@
 
         row.appendChild(head);
         row.appendChild(reason);
+        return row;
+      }
 
-        els.streamList.insertBefore(row, els.streamList.firstChild);
-        while (els.streamList.children.length > MAX_STREAM_EVENTS) {
-          els.streamList.removeChild(els.streamList.lastChild);
+      function renderStream() {
+        clearChildren(els.streamList);
+
+        var filterVal = els.streamFilter ? els.streamFilter.value : 'all';
+        var searchVal = els.streamSearch ? els.streamSearch.value : '';
+
+        var visible = [];
+        for (var i = 0; i < streamEvents.length; i++) {
+          if (matchesStreamFilter(streamEvents[i], filterVal, searchVal)) {
+            visible.push(streamEvents[i]);
+          }
         }
+
+        if (visible.length === 0) {
+          var empty = document.createElement('div');
+          empty.className = 'empty';
+          if (streamEvents.length > 0) {
+            empty.textContent = 'No events match the current filter.';
+          } else {
+            empty.textContent = activeToken
+              ? 'Waiting for live events...'
+              : 'Connect with a Bearer token to subscribe to /events.';
+          }
+          els.streamList.appendChild(empty);
+          return;
+        }
+
+        var frag = document.createDocumentFragment();
+        for (var j = 0; j < visible.length; j++) {
+          frag.appendChild(buildStreamRow(visible[j]));
+        }
+        els.streamList.appendChild(frag);
+      }
+
+      function pushStreamEvent(ev) {
+        streamEvents.unshift(ev);
+        if (streamEvents.length > MAX_STREAM_EVENTS) {
+          streamEvents.length = MAX_STREAM_EVENTS;
+        }
+        if (streamPaused) {
+          return;
+        }
+        renderStream();
       }
 
       async function startEventStream() {
@@ -926,7 +1061,7 @@
 
         var controller = new AbortController();
         sseAbortController = controller;
-        els.streamStatus.textContent = 'Connecting...';
+        setStreamStatus('Connecting...');
         setNotice(els.streamNotice, null);
 
         try {
@@ -939,18 +1074,18 @@
           if (res.status === 401) {
             setNotice(els.streamNotice, 'Authentication failed (401 Unauthorized) on /events.', 'err');
             setConnectionState('error', 'Unauthorized');
-            els.streamStatus.textContent = 'Unauthorized';
+            setStreamStatus('Unauthorized');
             return;
           }
           if (!res.ok || !res.body) {
             setNotice(els.streamNotice, 'Failed to open /events stream: HTTP ' + res.status, 'err');
-            els.streamStatus.textContent = 'Error';
+            setStreamStatus('Error');
             scheduleStreamReconnect();
             return;
           }
 
           setConnectionState('connected', 'Connected');
-          els.streamStatus.textContent = 'Streaming';
+          setStreamStatus('Streaming');
 
           var reader = res.body.getReader();
           var decoder = new TextDecoder('utf-8');
@@ -976,7 +1111,7 @@
                   dataLines = [];
                   try {
                     var parsed = JSON.parse(payloadText);
-                    appendStreamEvent(parsed);
+                    pushStreamEvent(parsed);
                   } catch (parseErr) {
                     // Ignore malformed event frame
                   }
@@ -994,14 +1129,14 @@
           }
 
           if (!controller.signal.aborted && activeToken) {
-            els.streamStatus.textContent = 'Reconnecting...';
+            setStreamStatus('Reconnecting...');
             scheduleStreamReconnect();
           }
         } catch (err) {
           if (controller.signal.aborted) {
             return;
           }
-          els.streamStatus.textContent = 'Disconnected';
+          setStreamStatus('Disconnected');
           setNotice(els.streamNotice, 'Stream disconnected. Reconnecting...', 'warn');
           scheduleStreamReconnect();
         }
@@ -1057,7 +1192,7 @@
         els.disconnectBtn.hidden = true;
         els.connectBtn.textContent = 'Connect';
         setConnectionState('disconnected', 'Disconnected');
-        els.streamStatus.textContent = 'Idle';
+        setStreamStatus('Idle');
 
         if (p10PollTimer) {
           clearInterval(p10PollTimer);
@@ -1084,14 +1219,27 @@
         disconnect();
       });
 
-      els.clearStreamBtn.addEventListener('click', function () {
-        clearChildren(els.streamList);
-        var empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = activeToken
-          ? 'Waiting for live events...'
-          : 'Connect with a Bearer token to subscribe to /events.';
-        els.streamList.appendChild(empty);
+      els.streamFilter.addEventListener('change', function () {
+        renderStream();
+      });
+
+      els.streamSearch.addEventListener('input', function () {
+        renderStream();
+      });
+
+      els.streamPauseBtn.addEventListener('click', function () {
+        streamPaused = !streamPaused;
+        els.streamPauseBtn.setAttribute('aria-pressed', streamPaused ? 'true' : 'false');
+        els.streamPauseBtn.textContent = streamPaused ? 'Resume' : 'Pause';
+        setStreamStatus(baseStreamStatus);
+        if (!streamPaused) {
+          renderStream();
+        }
+      });
+
+      els.streamClearBtn.addEventListener('click', function () {
+        streamEvents = [];
+        renderStream();
       });
 
       initMetricCards();

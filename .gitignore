@@ -3,6 +3,7 @@
 *.jsonl
 .env
 .env.*
+!.env.example
 .gstack/
 .agents/
 .DS_Store

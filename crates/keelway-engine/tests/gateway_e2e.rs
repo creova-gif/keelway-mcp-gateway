@@ -2396,3 +2396,146 @@ permit(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn security_headers_and_authz_boundaries_hold_across_all_endpoints()
+-> Result<(), KeelwayError> {
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("sec-headers-tape.jsonl");
+    let cfg = GatewayConfig {
+        tape_path: tape_path.clone(),
+        principals: vec![
+            PrincipalConfig {
+                org_id: "acme".to_owned(),
+                agent_id: "dev-agent".to_owned(),
+                roles: vec!["developer".to_owned()],
+                token_ref: Some("tok-dev".to_owned()),
+            },
+            PrincipalConfig {
+                org_id: "acme".to_owned(),
+                agent_id: "approver".to_owned(),
+                roles: vec!["p10-approver".to_owned()],
+                token_ref: Some("tok-approver".to_owned()),
+            },
+        ],
+        servers: vec![],
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"list_tool",
+    resource
+);
+"#;
+
+    let secrets = MapSecrets(HashMap::new());
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path, &secrets)?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let assert_sec_headers = |headers: &reqwest::header::HeaderMap, endpoint: &str| {
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff"),
+            "missing/invalid x-content-type-options on {endpoint}"
+        );
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "missing/invalid cache-control on {endpoint}"
+        );
+    };
+
+    // Public operational endpoints carry security headers
+    for endpoint in ["/healthz", "/readyz", "/metrics"] {
+        let resp = client
+            .get(format!("{base}{endpoint}"))
+            .send()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+        assert_sec_headers(resp.headers(), endpoint);
+    }
+
+    // /p10/pending as approver carries security headers
+    let p10_ok = client
+        .get(format!("{base}/p10/pending"))
+        .header("authorization", "Bearer tok-approver")
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(p10_ok.status(), reqwest::StatusCode::OK);
+    assert_sec_headers(p10_ok.headers(), "/p10/pending");
+
+    // /mcp without token -> 401 Unauthorized + x-trace-id + security headers
+    let mcp_no_auth = client
+        .post(format!("{base}/mcp"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(mcp_no_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        mcp_no_auth.headers().get("x-trace-id").is_some(),
+        "expected x-trace-id on 401 /mcp without token"
+    );
+    assert_sec_headers(mcp_no_auth.headers(), "/mcp (no auth)");
+
+    // /mcp with invalid token -> 401 Unauthorized + x-trace-id + security headers
+    let mcp_bad_auth = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", "Bearer invalid-token")
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(mcp_bad_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        mcp_bad_auth.headers().get("x-trace-id").is_some(),
+        "expected x-trace-id on 401 /mcp with invalid token"
+    );
+    assert_sec_headers(mcp_bad_auth.headers(), "/mcp (bad auth)");
+
+    // /mcp with valid token -> 200 OK + security headers
+    let mcp_ok = client
+        .post(format!("{base}/mcp"))
+        .header("authorization", "Bearer tok-dev")
+        .json(&json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(mcp_ok.status(), reqwest::StatusCode::OK);
+    assert_sec_headers(mcp_ok.headers(), "/mcp (valid auth)");
+
+    // Non-approver principals get 403 Forbidden on /p10/pending and /p10/resolve
+    let pending_forbidden = client
+        .get(format!("{base}/p10/pending"))
+        .header("authorization", "Bearer tok-dev")
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(pending_forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_sec_headers(pending_forbidden.headers(), "/p10/pending (403)");
+
+    let resolve_forbidden = client
+        .post(format!("{base}/p10/resolve"))
+        .header("authorization", "Bearer tok-dev")
+        .json(&json!({ "approval_id": "nonexistent-gate", "approved": true }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(resolve_forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_sec_headers(resolve_forbidden.headers(), "/p10/resolve (403)");
+
+    Ok(())
+}

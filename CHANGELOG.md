@@ -13,12 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Configurable Circuit Breaker Thresholds**: Added `circuit_breaker_failure_threshold` and `circuit_breaker_cooldown_secs` configuration fields for per-upstream circuit breakers.
 - **Operational Metrics & Health Telemetry**: Added `uptime_seconds` to `GET /healthz`, exposed `keelway_active_upstream_inflight` and `keelway_circuits_open` Prometheus gauges on `GET /metrics`, and added `Open Circuits`, `Active In-Flight`, and `Gateway Uptime` cards to the Operator Console (`GET /ui`).
 - **Router-Wide Security Headers**: Applied defensive HTTP security headers across all gateway router responses.
-- **Container & Compose Deployment**: Added production `Dockerfile` and `deploy/compose.yaml` for containerized gateway deployments.
+- **Container & Compose Deployment**: Added production `Dockerfile`, `deploy/compose.yaml`, and `.env.example` for containerized gateway deployments.
+- **Repository Governance & Dependency Automation**: Added `.github/CODEOWNERS` and `.github/dependabot.yml`.
 - **Trace Inspection Filters**: Added `--tail`, `--trace-id`, `--decision`, and `--outcome` filtering options to `keelway trace inspect`.
 
 ### Changed
 - **BudgetTracker Idle Bucket Eviction**: Added automatic eviction of idle sliding-window rate-limit buckets in `BudgetTracker` to bound long-running memory usage.
-- **Operator Console Accessibility (`GET /ui`)**: Added WCAG 2.1 AA accessibility enhancements to the embedded operator console.
+- **Operator Console (`GET /ui`)**: Added WCAG 2.1 AA accessibility enhancements and live stream filtering, search, and pause controls to the embedded operator console.
+- **Preflight Validation (`keelway doctor`)**: Added positive-bound validation rejecting zero values for `max_request_bytes`, `max_response_bytes`, and `circuit_breaker_failure_threshold`.
 - **Release Benchmarks (`v0.3.0`)**: Refreshed measured local release benchmarks for `keelway-engine v0.3.0` in `README.md`.
 
 ## [0.3.0] - 2026-11-26

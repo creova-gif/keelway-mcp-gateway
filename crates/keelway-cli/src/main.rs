@@ -785,6 +785,16 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
 }
 
 fn validate_config_bindings(config: &GatewayConfig) -> Result<(), String> {
+    if config.max_request_bytes == 0 {
+        return Err("max_request_bytes must be greater than 0".to_owned());
+    }
+    if config.max_response_bytes == 0 {
+        return Err("max_response_bytes must be greater than 0".to_owned());
+    }
+    if config.circuit_breaker_failure_threshold == 0 {
+        return Err("circuit_breaker_failure_threshold must be greater than 0".to_owned());
+    }
+
     let mut seen_aliases: HashSet<&str> = HashSet::new();
     for server in &config.servers {
         validate_server_alias(&server.alias).map_err(|e| e.to_string())?;
@@ -1672,6 +1682,30 @@ servers:
             fail_stdio_cfg.as_os_str(),
         ]))?;
         assert!(run(fail_stdio_cli).await.is_err());
+
+        // 5. Zero-bound config fields fail doctor positive-bound validation.
+        let fail_bounds_cfg = dir.join("fail-bounds.yaml");
+        fs::write(
+            &fail_bounds_cfg,
+            r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+max_request_bytes: 0
+policy_files:
+  - "policies/simple.cedar"
+principals:
+  - org_id: "acme"
+    agent_id: "coding-agent"
+    roles: ["developer"]
+servers: []
+"#,
+        )?;
+        let fail_bounds_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            fail_bounds_cfg.as_os_str(),
+        ]))?;
+        assert!(run(fail_bounds_cli).await.is_err());
 
         Ok(())
     }

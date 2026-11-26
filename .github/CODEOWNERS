@@ -1,0 +1,6 @@
+# Default code owners for Keelway MCP Gateway
+* @creova-gif
+crates/ @creova-gif
+deploy/ @creova-gif
+.github/ @creova-gif
+docs/adr/ @creova-gif
