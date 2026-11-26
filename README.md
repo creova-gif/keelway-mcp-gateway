@@ -28,8 +28,11 @@ Keelway is a single-binary, fail-closed Rust execution gateway and offline polic
 
 - **Auth & Federation:** Exposes multiple upstream MCP servers under canonical `<server_alias>__<sanitized_tool_name>` identifiers with per-principal `tools/list` filtering.
 - **2-Stage Cedar + Typed Validators:** Stage 1 runs deterministic argument validators (`path_within`, `glob`, `regex`, `sql_readonly` via `sqlparser` AST, `repo_allowlist`) and injects results into `context.arg_checks.*`; Stage 2 evaluates schema-validated (`Validator::validate`) Amazon Cedar policies with lock-free `ArcSwap` hot reload.
+- **Execution Budgets & Clean-Env `stdio` Isolation:** Enforces per-principal / per-server rate and concurrency limits (`-32004 BudgetExceeded`) and spawns local `stdio` child processes with `env_clear()`, forwarding only a minimal safe baseline plus explicitly declared `server.transport.env` entries.
+- **P-10 Human Approval Gates:** Matching `approval_required` rules hold authorized calls in `AWAITING` state on an in-memory `oneshot` gate until resolved via `GET /p10/pending` and authenticated `POST /p10/resolve` (failing closed with `-32005 ApprovalDenied` on deny or timeout).
 - **OS-Thread SHA-256 Tape:** A dedicated OS thread batches and `sync_data()`-flushes hash-chained (`prev_hash` / `entry_hash`) JSONL receipts to `keelway-tape.jsonl`, failing closed (`-32001`) if persistence fails and verifying the full chain in O(1) memory on startup.
 - **Secret Scrubber:** Resolves `secret://env/...` and `secret://file/...` strictly inside the gateway and redacts registered secrets (`>= 8` bytes across raw, JSON-escaped, URL-encoded, and Base64 forms) via Aho-Corasick across responses, SSE chunk boundaries, `stderr`, console logs, and receipts.
+- **Real-Time Observability:** Exposes `GET /healthz`, `GET /metrics` (Prometheus text format), and `GET /events` (live SSE stream of gateway decisions and `AWAITING` gate events).
 
 ## Installation
 
@@ -90,6 +93,8 @@ See [benchmarks/competitor-dx-notes.md](benchmarks/competitor-dx-notes.md) for m
 - **Architecture & M1 Design:** [docs/designs/keelway-mcp-gateway-m1.md](docs/designs/keelway-mcp-gateway-m1.md)
 - **Threat Model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
 - **Architecture Decision Records:** [docs/adr/](docs/adr/)
+  - [ADR-003: Per-Principal Execution Budgets & Clean-Environment Stdio Isolation](docs/adr/003-execution-budgets-and-stdio-env-isolation.md)
+  - [ADR-004: P-10 Human-in-the-Loop Approval Gates & Real-Time Observability](docs/adr/004-p10-human-gates-and-observability.md)
 - **Security Policy & Disclosure:** [SECURITY.md](SECURITY.md)
 - **Contributing & Quality Gates:** [CONTRIBUTING.md](CONTRIBUTING.md)
 - **License:** [Apache-2.0](LICENSE)

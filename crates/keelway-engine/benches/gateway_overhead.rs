@@ -77,6 +77,7 @@ fn run_bench() -> Result<(), KeelwayError> {
         tape_path: PathBuf::from("unused.jsonl"),
         policy_files: vec![],
         budgets: vec![],
+        approval_required: vec![],
         principals: vec![
             PrincipalConfig {
                 org_id: "acme".to_owned(),

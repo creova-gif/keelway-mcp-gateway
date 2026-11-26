@@ -26,6 +26,10 @@ pub enum KeelwayError {
     UpstreamUnavailable(String),
     #[error("execution budget exceeded: {0}")]
     BudgetExceeded(String),
+    #[error("human approval denied: {0}")]
+    ApprovalDenied(String),
+    #[error("human approval timed out after {0}ms")]
+    ApprovalTimeout(u64),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -171,6 +175,8 @@ pub struct GatewayConfig {
     pub validators: Vec<ValidatorBinding>,
     #[serde(default)]
     pub budgets: Vec<BudgetRule>,
+    #[serde(default)]
+    pub approval_required: Vec<ApprovalRule>,
 }
 
 impl Default for GatewayConfig {
@@ -183,8 +189,26 @@ impl Default for GatewayConfig {
             servers: Vec::new(),
             validators: Vec::new(),
             budgets: Vec::new(),
+            approval_required: Vec::new(),
         }
     }
+}
+
+/// Per-principal, per-tool P-10 human-in-the-loop approval rule configured in `keelway.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRule {
+    pub org_id: String,
+    /// Agent identifier, or `"*"` for an org-wide rule.
+    #[serde(default = "default_wildcard")]
+    pub agent_id: String,
+    pub server: String,
+    pub tool: String,
+    #[serde(default = "default_approval_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_approval_timeout_ms() -> u64 {
+    60_000
 }
 
 /// Per-principal, per-server execution budget rule configured in `keelway.yaml`.

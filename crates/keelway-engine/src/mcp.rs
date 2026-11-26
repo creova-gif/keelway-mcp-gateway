@@ -4,13 +4,16 @@ use crate::core::{
     ServerConfig, ToolCall, UnsealedReceipt, UpstreamTransport, sanitize_federated_name,
     validate_server_alias,
 };
+use crate::metrics::{GatewayMetrics, LiveConsoleEvent};
+use crate::p10::P10GateManager;
 use crate::policy::PolicyEngine;
 use crate::secrets::{SecretProvider, SecretScrubber};
 use crate::tape::TapeWriter;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -30,6 +33,7 @@ pub const JSONRPC_TAPE_PERSISTENCE_ERR: i64 = -32001;
 pub const JSONRPC_UPSTREAM_TIMEOUT: i64 = -32002;
 pub const JSONRPC_UPSTREAM_UNAVAILABLE: i64 = -32003;
 pub const JSONRPC_BUDGET_EXCEEDED: i64 = -32004;
+pub const JSONRPC_APPROVAL_DENIED: i64 = -32005;
 
 /// Metadata for a federated upstream MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +353,8 @@ pub struct GatewayRuntime {
     pub scrubber: Arc<SecretScrubber>,
     pub registry: ToolRegistry,
     budgets: BudgetTracker,
+    p10: P10GateManager,
+    metrics: Arc<GatewayMetrics>,
     token_map: HashMap<String, Principal>,
     upstreams: HashMap<String, UpstreamDriver>,
     console_to_stderr: bool,
@@ -398,6 +404,8 @@ impl GatewayRuntime {
         let registry = ToolRegistry::build(federated_tools)?;
         let scrubber = Arc::new(SecretScrubber::new(&collected_secrets)?);
         let budgets = BudgetTracker::new(config.budgets.clone());
+        let p10 = P10GateManager::new(config.approval_required.clone());
+        let metrics = Arc::new(GatewayMetrics::new());
 
         Ok(Self {
             policy,
@@ -405,6 +413,8 @@ impl GatewayRuntime {
             scrubber,
             registry,
             budgets,
+            p10,
+            metrics,
             token_map,
             upstreams,
             console_to_stderr,
@@ -493,16 +503,27 @@ impl GatewayRuntime {
                     }
                 };
 
-                let state = match eval.decision {
-                    Decision::Allow => ReceiptState::Sealed,
-                    Decision::Deny => ReceiptState::Blocked,
-                };
-
                 let mut scrubbed_explanation = eval.explanation.clone();
                 scrubbed_explanation.reason = self.scrubber.scrub_str(&scrubbed_explanation.reason);
                 for vo in &mut scrubbed_explanation.validator_outcomes {
                     vo.reason = self.scrubber.scrub_str(&vo.reason);
                 }
+
+                let p10_timeout_ms = if eval.decision == Decision::Allow {
+                    self.p10.requires_approval(
+                        principal,
+                        &tool_meta.server_alias,
+                        &tool_meta.upstream_name,
+                    )
+                } else {
+                    None
+                };
+
+                let state = match (eval.decision, p10_timeout_ms) {
+                    (Decision::Allow, Some(_)) => ReceiptState::Awaiting,
+                    (Decision::Allow, None) => ReceiptState::Sealed,
+                    (Decision::Deny, _) => ReceiptState::Blocked,
+                };
 
                 let unsealed = UnsealedReceipt {
                     timestamp: Utc::now(),
@@ -510,8 +531,8 @@ impl GatewayRuntime {
                     agent_id: principal.agent_id.clone(),
                     server: tool_meta.server_alias.clone(),
                     tool: tool_meta.upstream_name.clone(),
-                    redacted_args,
-                    redacted_fields,
+                    redacted_args: redacted_args.clone(),
+                    redacted_fields: redacted_fields.clone(),
                     decision: eval.decision,
                     explanation: scrubbed_explanation.clone(),
                     policy_digest: scrubbed_explanation.policy_digest.clone(),
@@ -530,6 +551,17 @@ impl GatewayRuntime {
                     );
                 }
 
+                self.metrics.record_event(LiveConsoleEvent {
+                    timestamp: Utc::now(),
+                    org_id: principal.org_id.clone(),
+                    agent_id: principal.agent_id.clone(),
+                    server: tool_meta.server_alias.clone(),
+                    tool: tool_meta.upstream_name.clone(),
+                    decision: eval.decision,
+                    state,
+                    reason: scrubbed_explanation.reason.clone(),
+                });
+
                 self.emit_console_line(
                     &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
                     &principal.agent_id,
@@ -546,7 +578,7 @@ impl GatewayRuntime {
                     );
                 }
 
-                // Enforce per-principal/per-server execution budget before upstream dispatch (ADR-003).
+                // Enforce per-principal/per-server execution budget before P-10 or upstream dispatch (ADR-003).
                 let _budget_lease = match self.budgets.acquire(principal, &tool_meta.server_alias) {
                     Ok(lease) => lease,
                     Err(e) => {
@@ -576,6 +608,7 @@ impl GatewayRuntime {
                                 provenance: None,
                             })
                             .await;
+                        self.metrics.inc_calls_denied_budget();
                         self.emit_console_line(
                             &format!("{}.{}", tool_meta.server_alias, tool_meta.upstream_name),
                             &principal.agent_id,
@@ -590,6 +623,97 @@ impl GatewayRuntime {
                         );
                     }
                 };
+
+                // Enforce P-10 human-in-the-loop approval gate if configured (ADR-004).
+                if let Some(timeout_ms) = p10_timeout_ms {
+                    let (approval_id, rx) = self.p10.create_gate(
+                        principal,
+                        &tool_meta.server_alias,
+                        &tool_meta.upstream_name,
+                        redacted_args.clone(),
+                    );
+                    let wait_res =
+                        tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await;
+                    let approved = match wait_res {
+                        Ok(Ok(true)) => true,
+                        Ok(Ok(false)) | Ok(Err(_)) => false,
+                        Err(_) => {
+                            self.p10.cancel(&approval_id);
+                            false
+                        }
+                    };
+                    if !approved {
+                        self.metrics.inc_calls_p10_denied();
+                        let deny_reason = format!(
+                            "P-10 human approval denied or timed out (gate_id: {approval_id})"
+                        );
+                        let deny_expl = Explanation {
+                            decision: Decision::Deny,
+                            rule_ids: vec!["p10_gate".to_owned()],
+                            validator_outcomes: vec![],
+                            reason: deny_reason.clone(),
+                            policy_digest: scrubbed_explanation.policy_digest.clone(),
+                        };
+                        let _ = self
+                            .tape
+                            .append(UnsealedReceipt {
+                                timestamp: Utc::now(),
+                                org_id: principal.org_id.clone(),
+                                agent_id: principal.agent_id.clone(),
+                                server: tool_meta.server_alias.clone(),
+                                tool: tool_meta.upstream_name.clone(),
+                                redacted_args,
+                                redacted_fields,
+                                decision: Decision::Deny,
+                                explanation: deny_expl.clone(),
+                                policy_digest: deny_expl.policy_digest.clone(),
+                                state: ReceiptState::Blocked,
+                                outcome: None,
+                                provenance: None,
+                            })
+                            .await;
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_APPROVAL_DENIED,
+                            "ApprovalDenied",
+                            Some(serde_json::to_value(&deny_expl).unwrap_or(Value::Null)),
+                        );
+                    }
+                    self.metrics.inc_calls_p10_approved();
+                    let seal_expl = Explanation {
+                        decision: Decision::Allow,
+                        rule_ids: vec!["p10_gate".to_owned()],
+                        validator_outcomes: vec![],
+                        reason: format!("P-10 human approval granted (gate_id: {approval_id})"),
+                        policy_digest: scrubbed_explanation.policy_digest.clone(),
+                    };
+                    if let Err(e) = self
+                        .tape
+                        .append(UnsealedReceipt {
+                            timestamp: Utc::now(),
+                            org_id: principal.org_id.clone(),
+                            agent_id: principal.agent_id.clone(),
+                            server: tool_meta.server_alias.clone(),
+                            tool: tool_meta.upstream_name.clone(),
+                            redacted_args,
+                            redacted_fields,
+                            decision: Decision::Allow,
+                            explanation: seal_expl.clone(),
+                            policy_digest: seal_expl.policy_digest.clone(),
+                            state: ReceiptState::Sealed,
+                            outcome: None,
+                            provenance: None,
+                        })
+                        .await
+                    {
+                        return jsonrpc_error(
+                            id,
+                            JSONRPC_TAPE_PERSISTENCE_ERR,
+                            &format!("TapePersistenceError (fail-closed): {e}"),
+                            None,
+                        );
+                    }
+                }
 
                 // Dispatch to upstream MCP server
                 let Some(upstream) = self.upstreams.get(&tool_meta.server_alias) else {
@@ -611,6 +735,7 @@ impl GatewayRuntime {
                         "result": result
                     }),
                     Err(KeelwayError::UpstreamTimeout(ms)) => {
+                        self.metrics.inc_upstream_timeout();
                         let _ = self
                             .record_outcome(
                                 principal,
@@ -627,6 +752,7 @@ impl GatewayRuntime {
                         )
                     }
                     Err(e) => {
+                        self.metrics.inc_upstream_error();
                         let _ = self
                             .record_outcome(
                                 principal,
@@ -708,11 +834,118 @@ fn jsonrpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Va
     })
 }
 
-/// Builds the Streamable HTTP (`/mcp`) Axum router.
+/// Builds the Streamable HTTP (`/mcp`) and observability/P-10 Axum router.
 pub fn build_http_router(runtime: Arc<GatewayRuntime>) -> Router {
     Router::new()
         .route("/mcp", post(http_mcp_handler))
+        .route("/healthz", get(healthz_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/events", get(events_sse_handler))
+        .route("/p10/pending", get(p10_pending_handler))
+        .route("/p10/resolve", post(p10_resolve_handler))
         .with_state(runtime)
+}
+
+async fn healthz_handler() -> Response {
+    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+}
+
+async fn metrics_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response {
+    runtime
+        .metrics
+        .set_p10_pending(runtime.p10.pending_count() as u64);
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        runtime.metrics.render_prometheus(),
+    )
+        .into_response()
+}
+
+async fn events_sse_handler(
+    State(runtime): State<Arc<GatewayRuntime>>,
+    headers: HeaderMap,
+) -> Response {
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if runtime.authenticate_bearer(auth_header).is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthenticated" })),
+        )
+            .into_response();
+    }
+    let rx_owned = runtime.metrics.subscribe();
+    let sse_stream = futures_util::stream::unfold(rx_owned, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let payload = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                    return Some((
+                        Ok::<Event, std::convert::Infallible>(Event::default().data(payload)),
+                        rx,
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn p10_pending_handler(
+    State(runtime): State<Arc<GatewayRuntime>>,
+    headers: HeaderMap,
+) -> Response {
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthenticated" })),
+        )
+            .into_response();
+    };
+    let pending: Vec<_> = runtime
+        .p10
+        .list_pending()
+        .into_iter()
+        .filter(|p| p.org_id == principal.org_id)
+        .collect();
+    (StatusCode::OK, Json(json!({ "pending": pending }))).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct P10ResolveBody {
+    approval_id: String,
+    approved: bool,
+}
+
+async fn p10_resolve_handler(
+    State(runtime): State<Arc<GatewayRuntime>>,
+    headers: HeaderMap,
+    Json(body): Json<P10ResolveBody>,
+) -> Response {
+    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+    if runtime.authenticate_bearer(auth_header).is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthenticated" })),
+        )
+            .into_response();
+    }
+    match runtime.p10.resolve(&body.approval_id, body.approved) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "resolved": true }))).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn http_mcp_handler(
