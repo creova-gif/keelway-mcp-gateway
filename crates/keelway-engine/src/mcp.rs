@@ -159,6 +159,7 @@ impl UpstreamDriver {
         upstream_tool: &str,
         arguments: &Value,
         scrubber: &Arc<SecretScrubber>,
+        max_response_bytes: usize,
     ) -> Result<Value, KeelwayError> {
         let req_id = uuid::Uuid::new_v4().to_string();
         let rpc_body = json!({
@@ -215,6 +216,12 @@ impl UpstreamDriver {
                         return Err(KeelwayError::UpstreamUnavailable(
                             "stdio child exited unexpectedly (EOF)".to_owned(),
                         ));
+                    }
+                    if resp_line.len() > max_response_bytes {
+                        return Err(KeelwayError::Mcp(format!(
+                            "PayloadTooLarge: upstream response ({} bytes) exceed max_response_bytes ({max_response_bytes})",
+                            resp_line.len()
+                        )));
                     }
                     let scrubbed = scrubber.scrub_str(&resp_line);
                     let parsed: Value = serde_json::from_str(&scrubbed)?;
@@ -274,10 +281,17 @@ impl UpstreamDriver {
                 let mut streaming_scrubber = scrubber.streaming();
                 let mut byte_stream = resp.bytes_stream();
                 let mut assembled = String::new();
+                let mut total_bytes = 0usize;
                 while let Some(chunk_res) = byte_stream.next().await {
                     let chunk = chunk_res.map_err(|e| {
                         KeelwayError::UpstreamUnavailable(format!("stream read error: {e}"))
                     })?;
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+                    if total_bytes > max_response_bytes {
+                        return Err(KeelwayError::Mcp(format!(
+                            "PayloadTooLarge: upstream response ({total_bytes} bytes) exceed max_response_bytes ({max_response_bytes})"
+                        )));
+                    }
                     let chunk_str = String::from_utf8_lossy(&chunk);
                     assembled.push_str(&streaming_scrubber.push_chunk(&chunk_str));
                 }
@@ -487,15 +501,35 @@ impl GatewayRuntime {
                     .map(|v| v.len())
                     .unwrap_or(usize::MAX);
                 if req_bytes > self.max_request_bytes {
-                    return jsonrpc_error(
-                        id,
-                        JSONRPC_PAYLOAD_TOO_LARGE,
-                        &format!(
-                            "PayloadTooLarge: request arguments ({req_bytes} bytes) exceed max_request_bytes ({})",
-                            self.max_request_bytes
-                        ),
-                        None,
+                    let reason = format!(
+                        "PayloadTooLarge: request arguments ({req_bytes} bytes) exceed max_request_bytes ({})",
+                        self.max_request_bytes
                     );
+                    let _ = self
+                        .tape
+                        .append(UnsealedReceipt {
+                            timestamp: Utc::now(),
+                            org_id: principal.org_id.clone(),
+                            agent_id: principal.agent_id.clone(),
+                            server: fed_name.to_owned(),
+                            tool: fed_name.to_owned(),
+                            redacted_args: Value::Null,
+                            redacted_fields: vec![],
+                            decision: Decision::Deny,
+                            explanation: Explanation {
+                                decision: Decision::Deny,
+                                rule_ids: vec!["payload_limit".to_owned()],
+                                validator_outcomes: vec![],
+                                reason: reason.clone(),
+                                policy_digest: String::new(),
+                            },
+                            policy_digest: String::new(),
+                            state: ReceiptState::Blocked,
+                            outcome: None,
+                            provenance: None,
+                        })
+                        .await;
+                    return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
                 }
 
                 let Some(tool_meta) = self.registry.resolve(fed_name) else {
@@ -888,7 +922,12 @@ impl GatewayRuntime {
                 };
 
                 match upstream
-                    .call_tool(&tool_meta.upstream_name, &arguments, &self.scrubber)
+                    .call_tool(
+                        &tool_meta.upstream_name,
+                        &arguments,
+                        &self.scrubber,
+                        self.max_response_bytes,
+                    )
                     .await
                 {
                     Ok(result) => {
@@ -896,21 +935,68 @@ impl GatewayRuntime {
                             .map(|v| v.len())
                             .unwrap_or(usize::MAX);
                         if resp_bytes > self.max_response_bytes {
-                            return jsonrpc_error(
-                                id,
-                                JSONRPC_PAYLOAD_TOO_LARGE,
-                                &format!(
-                                    "PayloadTooLarge: upstream response ({resp_bytes} bytes) exceed max_response_bytes ({})",
-                                    self.max_response_bytes
-                                ),
-                                None,
+                            let reason = format!(
+                                "PayloadTooLarge: upstream response ({resp_bytes} bytes) exceed max_response_bytes ({})",
+                                self.max_response_bytes
                             );
+                            let _ = self
+                                .tape
+                                .append(UnsealedReceipt {
+                                    timestamp: Utc::now(),
+                                    org_id: principal.org_id.clone(),
+                                    agent_id: principal.agent_id.clone(),
+                                    server: tool_meta.server_alias.clone(),
+                                    tool: tool_meta.upstream_name.clone(),
+                                    redacted_args: Value::Null,
+                                    redacted_fields: vec![],
+                                    decision: Decision::Deny,
+                                    explanation: Explanation {
+                                        decision: Decision::Deny,
+                                        rule_ids: vec!["payload_limit".to_owned()],
+                                        validator_outcomes: vec![],
+                                        reason: reason.clone(),
+                                        policy_digest: eval.explanation.policy_digest.clone(),
+                                    },
+                                    policy_digest: eval.explanation.policy_digest.clone(),
+                                    state: ReceiptState::Blocked,
+                                    outcome: None,
+                                    provenance: None,
+                                })
+                                .await;
+                            return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
                         }
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": result
                         })
+                    }
+                    Err(KeelwayError::Mcp(msg)) if msg.starts_with("PayloadTooLarge:") => {
+                        let _ = self
+                            .tape
+                            .append(UnsealedReceipt {
+                                timestamp: Utc::now(),
+                                org_id: principal.org_id.clone(),
+                                agent_id: principal.agent_id.clone(),
+                                server: tool_meta.server_alias.clone(),
+                                tool: tool_meta.upstream_name.clone(),
+                                redacted_args: Value::Null,
+                                redacted_fields: vec![],
+                                decision: Decision::Deny,
+                                explanation: Explanation {
+                                    decision: Decision::Deny,
+                                    rule_ids: vec!["payload_limit".to_owned()],
+                                    validator_outcomes: vec![],
+                                    reason: msg.clone(),
+                                    policy_digest: eval.explanation.policy_digest.clone(),
+                                },
+                                policy_digest: eval.explanation.policy_digest.clone(),
+                                state: ReceiptState::Blocked,
+                                outcome: None,
+                                provenance: None,
+                            })
+                            .await;
+                        jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
                     }
                     Err(KeelwayError::UpstreamTimeout(ms)) => {
                         self.metrics.inc_upstream_timeout();
@@ -1014,8 +1100,10 @@ fn jsonrpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Va
 
 /// Builds the Streamable HTTP (`/mcp`) and observability/P-10 Axum router.
 pub fn build_http_router(runtime: Arc<GatewayRuntime>) -> Router {
+    let body_limit = runtime.max_request_bytes.saturating_add(64 * 1024);
     Router::new()
         .route("/mcp", post(http_mcp_handler))
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .route("/healthz", get(healthz_handler))
         .route("/metrics", get(metrics_handler))
         .route("/events", get(events_sse_handler))

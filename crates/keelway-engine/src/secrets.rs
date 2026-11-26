@@ -14,9 +14,11 @@ const MIN_SECRET_LEN: usize = 8;
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 
 static AWS_ACCESS_KEY_RE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").ok());
-static GITHUB_TOKEN_RE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b").ok());
+    LazyLock::new(|| Regex::new(r"(?P<prefix>^|[^A-Za-z0-9_]|\\[nrt])AKIA[0-9A-Z]{16}\b").ok());
+static GITHUB_TOKEN_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    Regex::new(r"(?P<prefix>^|[^A-Za-z0-9_]|\\[nrt])(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}\b")
+        .ok()
+});
 static PEM_PRIVATE_KEY_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----")
         .ok()
@@ -170,17 +172,18 @@ impl SecretScrubber {
         };
 
         if self.pattern_scrubbing {
-            for re in [
-                AWS_ACCESS_KEY_RE.as_ref(),
-                GITHUB_TOKEN_RE.as_ref(),
-                PEM_PRIVATE_KEY_RE.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
+            for re in [AWS_ACCESS_KEY_RE.as_ref(), GITHUB_TOKEN_RE.as_ref()]
+                .into_iter()
+                .flatten()
             {
-                if let Cow::Owned(replaced) = re.replace_all(&out, REDACTED_PLACEHOLDER) {
+                if let Cow::Owned(replaced) = re.replace_all(&out, "${prefix}[REDACTED]") {
                     out = replaced;
                 }
+            }
+            if let Some(re) = PEM_PRIVATE_KEY_RE.as_ref()
+                && let Cow::Owned(replaced) = re.replace_all(&out, REDACTED_PLACEHOLDER)
+            {
+                out = replaced;
             }
         }
 
@@ -253,12 +256,16 @@ pub struct StreamingScrubber<'a> {
 impl<'a> StreamingScrubber<'a> {
     /// Appends a new chunk and returns the safe-to-emit scrubbed prefix.
     pub fn push_chunk(&mut self, chunk: &str) -> String {
-        if self.scrubber.max_pattern_len <= 1 {
+        let keep_bytes = if self.scrubber.pattern_scrubbing {
+            self.scrubber.max_pattern_len.saturating_sub(1).max(256)
+        } else {
+            self.scrubber.max_pattern_len.saturating_sub(1)
+        };
+        if keep_bytes == 0 {
             return self.scrubber.scrub_str(chunk);
         }
         self.pending.push_str(chunk);
         let scrubbed = self.scrubber.scrub_str(&self.pending);
-        let keep_bytes = self.scrubber.max_pattern_len.saturating_sub(1);
         if scrubbed.len() <= keep_bytes {
             self.pending = scrubbed;
             return String::new();
