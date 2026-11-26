@@ -33,7 +33,7 @@ jobs:
           tar -C target/${{ matrix.target }}/release -czf ${{ matrix.archive }} keelway
           shasum -a 256 ${{ matrix.archive }} > ${{ matrix.archive }}.sha256
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: |
