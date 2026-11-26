@@ -583,8 +583,8 @@ impl GatewayRuntime {
                                 agent_id: principal.agent_id.clone(),
                                 server: tool_meta.server_alias.clone(),
                                 tool: tool_meta.upstream_name.clone(),
-                                redacted_args: Value::Null,
-                                redacted_fields: vec![],
+                                redacted_args: redacted_args.clone(),
+                                redacted_fields: redacted_fields.clone(),
                                 decision: Decision::Deny,
                                 explanation: budget_explanation.clone(),
                                 policy_digest: budget_explanation.policy_digest.clone(),
@@ -744,11 +744,14 @@ impl GatewayRuntime {
                     }
 
                     // Re-evaluate policy after P-10 approval in case hot reload revoked access while waiting.
-                    match self.policy.evaluate(principal, &tool_call) {
+                    let active_policy_digest = match self.policy.evaluate(principal, &tool_call) {
                         Ok(re_eval) if re_eval.decision == Decision::Deny => {
                             let mut re_expl = re_eval.explanation;
                             re_expl.reason = self.scrubber.scrub_str(&re_expl.reason);
-                            let _ = self
+                            for vo in &mut re_expl.validator_outcomes {
+                                vo.reason = self.scrubber.scrub_str(&vo.reason);
+                            }
+                            if let Err(e) = self
                                 .tape
                                 .append(UnsealedReceipt {
                                     timestamp: Utc::now(),
@@ -765,7 +768,15 @@ impl GatewayRuntime {
                                     outcome: None,
                                     provenance: None,
                                 })
-                                .await;
+                                .await
+                            {
+                                return jsonrpc_error(
+                                    id,
+                                    JSONRPC_TAPE_PERSISTENCE_ERR,
+                                    &format!("TapePersistenceError (fail-closed): {e}"),
+                                    None,
+                                );
+                            }
                             self.metrics.record_event(LiveConsoleEvent {
                                 timestamp: Utc::now(),
                                 org_id: principal.org_id.clone(),
@@ -792,8 +803,8 @@ impl GatewayRuntime {
                                 None,
                             );
                         }
-                        Ok(_) => {}
-                    }
+                        Ok(re_eval) => re_eval.explanation.policy_digest,
+                    };
 
                     let approve_reason =
                         format!("P-10 human approval granted (gate_id: {approval_id})");
@@ -802,7 +813,7 @@ impl GatewayRuntime {
                         rule_ids: vec!["p10_gate".to_owned()],
                         validator_outcomes: vec![],
                         reason: approve_reason.clone(),
-                        policy_digest: scrubbed_explanation.policy_digest.clone(),
+                        policy_digest: active_policy_digest,
                     };
                     if let Err(e) = self
                         .tape
@@ -1093,10 +1104,12 @@ async fn p10_resolve_handler(
         )
             .into_response();
     }
-    match runtime
-        .p10
-        .resolve(&body.approval_id, &principal.org_id, body.approved)
-    {
+    match runtime.p10.resolve(
+        &body.approval_id,
+        &principal.org_id,
+        &principal.agent_id,
+        body.approved,
+    ) {
         Ok(()) => (StatusCode::OK, Json(json!({ "resolved": true }))).into_response(),
         Err(KeelwayError::Auth(msg)) => {
             (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()

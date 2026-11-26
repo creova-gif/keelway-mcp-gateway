@@ -150,12 +150,13 @@ impl P10GateManager {
         }
     }
 
-    /// Resolves a pending gate by `approval_id` for `approver_org`, removing it
-    /// and sending `approved` on the associated `oneshot` channel.
+    /// Resolves a pending gate by `approval_id` for `approver_org` and `approver_agent`,
+    /// removing it and sending `approved` on the associated `oneshot` channel.
     pub fn resolve(
         &self,
         approval_id: &str,
         approver_org: &str,
+        approver_agent: &str,
         approved: bool,
     ) -> Result<(), KeelwayError> {
         let mut guard = self
@@ -170,6 +171,11 @@ impl P10GateManager {
         if entry.info.org_id != approver_org {
             return Err(KeelwayError::Auth(format!(
                 "cross-tenant P-10 resolution forbidden for org '{approver_org}'"
+            )));
+        }
+        if entry.info.agent_id == approver_agent {
+            return Err(KeelwayError::Auth(format!(
+                "self-approval forbidden for agent '{approver_agent}'"
             )));
         }
         let entry = guard
@@ -274,7 +280,7 @@ mod tests {
             json!({"repo": "keelway", "token": "[REDACTED]"})
         );
 
-        mgr.resolve(&id, "org-a", true)?;
+        mgr.resolve(&id, "org-a", "approver-1", true)?;
         assert!(mgr.list_pending().is_empty());
         assert!(rx.await?);
         Ok(())
@@ -291,7 +297,7 @@ mod tests {
             json!({}),
         );
 
-        mgr.resolve(&id, "org-a", false)?;
+        mgr.resolve(&id, "org-a", "approver-1", false)?;
         assert!(mgr.list_pending().is_empty());
         assert!(!rx.await?);
         Ok(())
@@ -316,12 +322,12 @@ mod tests {
     #[test]
     fn resolve_unknown_id_returns_err() {
         let mgr = P10GateManager::new(Vec::new());
-        let err = mgr.resolve("nonexistent-id", "org-a", true);
+        let err = mgr.resolve("nonexistent-id", "org-a", "approver-1", true);
         assert!(matches!(err, Err(KeelwayError::Mcp(_))));
     }
 
     #[tokio::test]
-    async fn resolve_cross_tenant_is_rejected_without_removing_gate()
+    async fn resolve_cross_tenant_and_self_approval_rejected_without_removing_gate()
     -> Result<(), Box<dyn std::error::Error>> {
         let mgr = P10GateManager::new(Vec::new());
         let (id, rx) = mgr.create_gate(
@@ -331,11 +337,15 @@ mod tests {
             json!({}),
         );
 
-        let err = mgr.resolve(&id, "org-b", true);
-        assert!(matches!(err, Err(KeelwayError::Auth(_))));
+        let cross_err = mgr.resolve(&id, "org-b", "approver-1", true);
+        assert!(matches!(cross_err, Err(KeelwayError::Auth(_))));
         assert_eq!(mgr.pending_count(), 1);
 
-        mgr.resolve(&id, "org-a", true)?;
+        let self_err = mgr.resolve(&id, "org-a", "agent-1", true);
+        assert!(matches!(self_err, Err(KeelwayError::Auth(_))));
+        assert_eq!(mgr.pending_count(), 1);
+
+        mgr.resolve(&id, "org-a", "approver-1", true)?;
         assert!(rx.await?);
         Ok(())
     }
@@ -351,7 +361,7 @@ mod tests {
         );
         drop(rx);
 
-        let err = mgr.resolve(&id, "org-a", true);
+        let err = mgr.resolve(&id, "org-a", "approver-1", true);
         assert!(matches!(err, Err(KeelwayError::Mcp(_))));
         assert_eq!(mgr.pending_count(), 0);
     }

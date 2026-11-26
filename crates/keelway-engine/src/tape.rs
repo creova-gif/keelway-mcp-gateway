@@ -1,6 +1,4 @@
-use crate::core::{
-    Decision, KeelwayError, Principal, Receipt, ReceiptState, ToolCall, UnsealedReceipt,
-};
+use crate::core::{Decision, KeelwayError, Principal, Receipt, ToolCall, UnsealedReceipt};
 use crate::policy::PolicyEngine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -309,18 +307,14 @@ pub fn replay_tape(
 ) -> Result<Vec<ReplayEntry>, KeelwayError> {
     let mut entries = Vec::new();
     stream_receipts(path, |receipt| {
-        if receipt.state == ReceiptState::Awaiting
-            || receipt
-                .explanation
-                .rule_ids
-                .iter()
-                .any(|r| r == "p10_gate" || r == "budget")
-            || receipt.explanation.reason == "unauthenticated"
+        if receipt.decision == Decision::Deny
+            && (receipt.explanation.reason == "unauthenticated"
+                || receipt
+                    .explanation
+                    .rule_ids
+                    .iter()
+                    .any(|r| r == "p10_gate" || r == "budget"))
         {
-            let replayed_verdict = match receipt.decision {
-                Decision::Allow => ReplayVerdict::Allow,
-                Decision::Deny => ReplayVerdict::Deny,
-            };
             entries.push(ReplayEntry {
                 seq: receipt.seq,
                 org_id: receipt.org_id,
@@ -328,7 +322,7 @@ pub fn replay_tape(
                 server: receipt.server,
                 tool: receipt.tool,
                 original_decision: receipt.decision,
-                replayed_verdict,
+                replayed_verdict: ReplayVerdict::Deny,
                 changed: false,
                 reason: "lifecycle receipt (non-Cedar gate); preserved".to_owned(),
             });
@@ -404,6 +398,7 @@ pub fn replay_tape(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReceiptState;
     use crate::core::Explanation;
     use chrono::Utc;
     use serde_json::json;
