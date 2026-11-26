@@ -22,7 +22,7 @@ unimplemented = "deny"
 aho-corasick = "1"
 arc-swap = "1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 cedar-policy = "4"
 chrono = { version = "0.4", features = ["serde"] }
