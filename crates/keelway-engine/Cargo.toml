@@ -20,6 +20,7 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 globset.workspace = true
 hex.workspace = true
+jsonwebtoken.workspace = true
 percent-encoding.workspace = true
 regex.workspace = true
 reqwest.workspace = true

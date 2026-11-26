@@ -2,6 +2,7 @@ use crate::core::{Decision, KeelwayError, Principal, Receipt, ToolCall, Unsealed
 use crate::policy::PolicyEngine;
 use crate::provenance::TapeSigner;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -377,10 +378,23 @@ pub fn replay_tape(
             return Ok(());
         }
 
+        let mut roles = principal_roles_lookup(&receipt.org_id, &receipt.agent_id);
+        if roles.is_empty()
+            && let Some(recorded_roles) = receipt
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("roles"))
+                .and_then(Value::as_array)
+        {
+            roles = recorded_roles
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+        }
         let principal = Principal {
             org_id: receipt.org_id.clone(),
             agent_id: receipt.agent_id.clone(),
-            roles: principal_roles_lookup(&receipt.org_id, &receipt.agent_id),
+            roles,
         };
         let action_name = receipt
             .provenance
