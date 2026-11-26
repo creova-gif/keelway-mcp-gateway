@@ -4,8 +4,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use keelway_engine::core::{Decision, GatewayConfig, KeelwayError};
 use keelway_engine::{
-    BudgetRule, ExecutionOutcome, GatewayEngine, PrincipalConfig, Receipt, ReceiptState,
-    ReplayVerdict, SecretProvider, ServerConfig, UpstreamTransport, ValidatorBinding,
+    ApprovalRule, BudgetRule, ExecutionOutcome, GatewayEngine, PrincipalConfig, Receipt,
+    ReceiptState, ReplayVerdict, SecretProvider, ServerConfig, UpstreamTransport, ValidatorBinding,
     ValidatorKind,
 };
 use serde_json::{Value, json};
@@ -132,6 +132,7 @@ async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Res
         tape_path: tape_path.clone(),
         policy_files: vec![],
         budgets: vec![],
+        approval_required: vec![],
         principals: vec![
             PrincipalConfig {
                 org_id: "acme".to_owned(),
@@ -384,6 +385,7 @@ async fn stdio_upstream_federation_injects_env_and_scrubs_stdout_and_stderr()
         tape_path: tape_path.clone(),
         policy_files: vec![],
         budgets: vec![],
+        approval_required: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -474,6 +476,7 @@ async fn stdio_upstream_timeout_returns_32002_and_records_timeout_receipt()
         tape_path: tape_path.clone(),
         policy_files: vec![],
         budgets: vec![],
+        approval_required: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -555,6 +558,7 @@ async fn stdio_upstream_crash_returns_32003_and_records_crashed_receipt() -> Res
         tape_path: tape_path.clone(),
         policy_files: vec![],
         budgets: vec![],
+        approval_required: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -769,6 +773,7 @@ async fn execution_budget_blocks_excess_calls_with_32004_and_records_deny_receip
         bind_addr: "127.0.0.1:0".to_owned(),
         tape_path: tape_path.clone(),
         policy_files: vec![],
+        approval_required: vec![],
         budgets: vec![BudgetRule {
             org_id: "acme".to_owned(),
             agent_id: "research-agent".to_owned(),
@@ -883,6 +888,7 @@ async fn stdio_child_env_clear_isolates_inherited_host_secrets() -> Result<(), K
         tape_path: tape_path.clone(),
         policy_files: vec![],
         budgets: vec![],
+        approval_required: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -939,5 +945,151 @@ permit(
 
     assert_eq!(resp["result"]["host_leak"], "");
     assert_eq!(resp["result"]["explicit"], "allowed_val");
+    Ok(())
+}
+
+#[tokio::test]
+async fn p10_human_gate_and_observability_endpoints_work_end_to_end() -> Result<(), KeelwayError> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db_url = spawn_mock_mcp_server(None, calls.clone()).await?;
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-tape.jsonl");
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        budgets: vec![],
+        approval_required: vec![ApprovalRule {
+            org_id: "acme".to_owned(),
+            agent_id: "research-agent".to_owned(),
+            server: "database".to_owned(),
+            tool: "query_readonly".to_owned(),
+            timeout_ms: 5_000,
+        }],
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "research-agent".to_owned(),
+            roles: vec!["researcher".to_owned()],
+            token_ref: Some("tok-p10".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "database".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["query_readonly".to_owned()],
+            transport: UpstreamTransport::StreamableHttp {
+                url: db_url,
+                headers: BTreeMap::new(),
+            },
+        }],
+        validators: vec![ValidatorBinding {
+            id: "readonly_sql".to_owned(),
+            server: "database".to_owned(),
+            tool: "query_readonly".to_owned(),
+            arg_name: "sql".to_owned(),
+            kind: ValidatorKind::SqlReadonly,
+        }],
+    };
+
+    let p10_cedar = r#"
+permit(
+    principal in Role::"researcher",
+    action == Action::"call_tool",
+    resource == Tool::"database/query_readonly"
+) when {
+    context.arg_checks.readonly_sql
+};
+"#;
+    let engine = GatewayEngine::from_in_memory(cfg, p10_cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(HashMap::new()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let base = format!("http://{gw_addr}");
+
+    // 1. /healthz returns 200 ok
+    let hz = client
+        .get(format!("{base}/healthz"))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(hz.status(), reqwest::StatusCode::OK);
+
+    // 2. Launch a tool call that hits the P-10 gate; approve it asynchronously
+    let client_call = client.clone();
+    let mcp_url = format!("{base}/mcp");
+    let call_task = tokio::spawn(async move {
+        client_call
+            .post(&mcp_url)
+            .header("authorization", "Bearer tok-p10")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "database__query_readonly", "arguments": { "sql": "SELECT 42" } }
+            }))
+            .send()
+            .await
+    });
+
+    // Poll /p10/pending until the gate appears, then approve it
+    let mut approval_id = None;
+    for _ in 0..40 {
+        let pend: Value = client
+            .get(format!("{base}/p10/pending"))
+            .header("authorization", "Bearer tok-p10")
+            .send()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+        if let Some(first) = pend["pending"].as_array().and_then(|a| a.first()) {
+            approval_id = first["approval_id"].as_str().map(str::to_owned);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let gate_id =
+        approval_id.ok_or_else(|| KeelwayError::Mcp("P-10 gate never appeared".to_owned()))?;
+
+    let resolve_resp = client
+        .post(format!("{base}/p10/resolve"))
+        .header("authorization", "Bearer tok-p10")
+        .json(&json!({ "approval_id": gate_id, "approved": true }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(resolve_resp.status(), reqwest::StatusCode::OK);
+
+    let call_res: Value = call_task
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(call_res["result"]["content"][0]["text"], "ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // 3. /metrics reflects p10_approved=1 and calls_allowed=1
+    let metrics_text = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .text()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert!(metrics_text.contains("keelway_calls_total{outcome=\"p10_approved\"} 1"));
+
+    // 4. Verify tape recorded AWAITING + SEALED receipts cleanly
+    let verified = GatewayEngine::verify_tape(&tape_path)?;
+    assert!(verified.valid);
+    assert_eq!(verified.count, 2);
     Ok(())
 }

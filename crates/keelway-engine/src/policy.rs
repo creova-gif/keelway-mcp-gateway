@@ -726,6 +726,7 @@ mod tests {
             tape_path: PathBuf::from("keelway-tape.jsonl"),
             policy_files: vec![],
             budgets: vec![],
+            approval_required: vec![],
             principals: vec![
                 PrincipalConfig {
                     org_id: "acme".to_owned(),
