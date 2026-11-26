@@ -1,5 +1,6 @@
 pub mod auth;
 pub(crate) mod budget;
+pub mod circuit;
 pub mod core;
 pub(crate) mod mcp;
 pub(crate) mod metrics;
@@ -8,6 +9,7 @@ pub(crate) mod policy;
 pub mod provenance;
 pub(crate) mod secrets;
 pub(crate) mod tape;
+mod upstream;
 
 use crate::core::{GatewayConfig, KeelwayError, PolicyDecision, Principal, ToolCall};
 use crate::mcp::{GatewayRuntime, build_http_router, serve_stdio_loop};
@@ -251,6 +253,7 @@ impl GatewayEngine {
             self.config.bind_addr
         );
         axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| KeelwayError::Mcp(format!("http server error: {e}")))
     }
@@ -432,5 +435,35 @@ fn perform_hot_reload(
                 "hot-reload rejected; keeping last known-good policy snapshot live"
             );
         }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %err, "failed to install Ctrl+C shutdown handler");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to install SIGTERM shutdown handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT (Ctrl+C); draining HTTP connections"),
+        _ = terminate => tracing::info!("received SIGTERM; draining HTTP connections"),
     }
 }

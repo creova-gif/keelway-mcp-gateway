@@ -1989,3 +1989,143 @@ permit(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn circuit_breaker_trips_on_repeated_upstream_failures_and_updates_readyz()
+-> Result<(), KeelwayError> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_ref = calls.clone();
+    let upstream = Router::new().route(
+        "/mcp",
+        post(move || {
+            let calls_ref = calls_ref.clone();
+            async move {
+                calls_ref.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, "upstream down")
+            }
+        }),
+    );
+    let up_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let up_addr = up_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(up_listener, upstream).await;
+    });
+
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("cb-e2e-tape.jsonl");
+    let cfg = GatewayConfig {
+        tape_path: tape_path.clone(),
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-cb".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "flaky".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["ping".to_owned()],
+            resources: vec![],
+            prompts: vec![],
+            transport: UpstreamTransport::StreamableHttp {
+                url: format!("http://{up_addr}/mcp"),
+                headers: BTreeMap::new(),
+            },
+        }],
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"flaky/ping"
+);
+"#;
+
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path, &MapSecrets(HashMap::new()))?;
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let readyz_url = format!("http://{gw_addr}/readyz");
+    let mcp_url = format!("http://{gw_addr}/mcp");
+
+    let init_readyz = client
+        .get(&readyz_url)
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(init_readyz.status(), reqwest::StatusCode::OK);
+    let init_readyz_body: Value = init_readyz
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(init_readyz_body["ready"], true);
+
+    for id in 1..=5 {
+        let resp: Value = client
+            .post(&mcp_url)
+            .header("authorization", "Bearer tok-cb")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "flaky__ping", "arguments": {} }
+            }))
+            .send()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+        assert_eq!(resp["error"]["code"], -32003);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    // 6th call fails fast with circuit breaker open without hitting upstream.
+    let tripped: Value = client
+        .post(&mcp_url)
+        .header("authorization", "Bearer tok-cb")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": { "name": "flaky__ping", "arguments": {} }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(tripped["error"]["code"], -32003);
+    assert!(
+        tripped["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("circuit breaker open")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    let open_readyz = client
+        .get(&readyz_url)
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(
+        open_readyz.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let open_readyz_body: Value = open_readyz
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(open_readyz_body["ready"], false);
+
+    Ok(())
+}

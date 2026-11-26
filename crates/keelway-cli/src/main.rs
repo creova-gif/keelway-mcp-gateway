@@ -510,6 +510,37 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
         }
     }
 
+    if let Some(jwt_cfg) = &config.jwt_auth {
+        let mut resolved_cfg = jwt_cfg.clone();
+        let secret_res = match &jwt_cfg.hs256_secret {
+            Some(secret_ref) if secret_ref.starts_with("secret://") => {
+                resolve_secret_ref_value(secret_ref).map(Some)
+            }
+            other => Ok(other.clone()),
+        };
+        match secret_res.and_then(|resolved_secret| {
+            resolved_cfg.hs256_secret = resolved_secret;
+            keelway_engine::auth::JwtVerifier::new(resolved_cfg).map_err(|e| e.to_string())
+        }) {
+            Ok(_) => checks.push(DoctorCheck {
+                status: "PASS",
+                name: "JWT Auth".to_owned(),
+                detail: format!(
+                    "issuer '{}', audience '{}' validated",
+                    jwt_cfg.issuer, jwt_cfg.audience
+                ),
+            }),
+            Err(msg) => {
+                failures += 1;
+                checks.push(DoctorCheck {
+                    status: "FAIL",
+                    name: "JWT Auth".to_owned(),
+                    detail: msg,
+                });
+            }
+        }
+    }
+
     let secret_refs = collect_secret_refs(&config);
     if secret_refs.is_empty() {
         checks.push(DoctorCheck {
@@ -686,6 +717,14 @@ fn collect_secret_refs(config: &GatewayConfig) -> Vec<(String, String)> {
                 token_ref.clone(),
             ));
         }
+    }
+    if let Some(hs256_secret) = config
+        .jwt_auth
+        .as_ref()
+        .and_then(|j| j.hs256_secret.as_ref())
+        && hs256_secret.starts_with("secret://")
+    {
+        refs.push(("jwt_auth.hs256_secret".to_owned(), hs256_secret.clone()));
     }
     refs
 }
@@ -1379,6 +1418,69 @@ servers:
             vk_hex.as_ref(),
         ]))?;
         assert!(run(inspect_unsigned).await.is_err());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_doctor_validates_jwt_auth_config() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("doctor-jwt")?;
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("policies"))?;
+        fs::write(
+            dir.join("policies/simple.cedar"),
+            "permit(principal in Role::\"developer\", action == Action::\"list_tool\", resource);\n",
+        )?;
+
+        let secret_file = dir.join("jwt.secret");
+        fs::write(&secret_file, "a".repeat(32))?;
+
+        let pass_cfg = dir.join("jwt-pass.yaml");
+        fs::write(
+            &pass_cfg,
+            format!(
+                r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/simple.cedar"
+jwt_auth:
+  issuer: "https://issuer.example.com"
+  audience: "keelway-gateway"
+  hs256_secret: "secret://file/{secret}"
+"#,
+                secret = secret_file.display()
+            ),
+        )?;
+
+        let pass_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            pass_cfg.as_os_str(),
+        ]))?;
+        assert_eq!(run(pass_cli).await?, ExitCode::SUCCESS);
+
+        let weak_cfg = dir.join("jwt-weak.yaml");
+        fs::write(
+            &weak_cfg,
+            r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/simple.cedar"
+jwt_auth:
+  issuer: "https://issuer.example.com"
+  audience: "keelway-gateway"
+  hs256_secret: "too-short"
+"#,
+        )?;
+
+        let weak_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            weak_cfg.as_os_str(),
+        ]))?;
+        assert!(run(weak_cli).await.is_err());
 
         Ok(())
     }
