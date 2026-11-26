@@ -21,8 +21,8 @@ All HTTP responses include baseline security headers (`X-Content-Type-Options: n
 
 Handles MCP JSON-RPC 2.0 requests (`initialize`, `tools/list`, `tools/call`, `resources/read`, `prompts/get`, and notifications).
 
-- **Authentication:** `Authorization: Bearer <token>` (configured static principal token or JWT/OIDC bearer token). Missing or invalid credentials return `401 Unauthorized` with `{"error": "unauthenticated"}` and record a best-effort `DENY` receipt.
-- **Tracing (`traceparent` / `x-trace-id`):** Extracts a valid 32-hex `trace_id` from an incoming W3C `traceparent` header (`00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>`), or generates a fresh 32-hex UUIDv4 trace ID. Every response (including `401` and `202`) includes the `x-trace-id` header.
+- **Authentication:** `Authorization: Bearer <token>` (configured static principal token or JWT/OIDC bearer token). For requests that reach the MCP handler (`http_mcp_handler`), missing or invalid credentials return `401 Unauthorized` with `{"error": "unauthenticated"}` and record a best-effort `DENY` receipt.
+- **Tracing (`traceparent` / `x-trace-id`):** For requests that reach `http_mcp_handler`, extracts a valid 32-hex `trace_id` from an incoming W3C `traceparent` header (`00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>`), or generates a fresh 32-hex UUIDv4 trace ID, and includes `x-trace-id` on every response (including `401` and `202`). Malformed JSON or oversized request bodies rejected earlier by the Axum JSON extractor do not receive the handler's authentication check, denial receipt, or `x-trace-id` header.
 - **Body Limits:** Enforces an Axum body limit of `max_request_bytes + 64 KiB`, plus per-call `max_request_bytes` and `max_response_bytes` JSON-RPC checks (`-32006`).
 - **Response Payloads:**
   - JSON-RPC request (contains `"id"`): `200 OK` with the JSON-RPC 2.0 response object.
@@ -88,9 +88,9 @@ Streams real-time gateway decision events (`text/event-stream`) with automatic k
     "agent_id": "coding-agent",
     "server": "github",
     "tool": "create_issue",
-    "decision": "Allow",
-    "state": "Sealed",
-    "outcome": "Allowed",
+    "decision": "ALLOW",
+    "state": "SEALED",
+    "outcome": "allowed",
     "reason": "permitted by policy1"
   }
   ```
@@ -143,7 +143,7 @@ Gateway-enforced errors on `POST /mcp` use standard JSON-RPC 2.0 error responses
 | Code | Name | Meaning |
 |---|---|---|
 | `-32000` | `PolicyDenied` | Call blocked by Cedar policy (default-deny or explicit `forbid` rule). |
-| `-32001` | `TapePersistenceError` | Fail-closed: audit receipt could not be persisted to `keelway-tape.jsonl` before upstream dispatch. |
+| `-32001` | `TapePersistenceError` | Fail-closed: audit receipt could not be persisted to `keelway-tape.jsonl` before upstream dispatch, or (for `resources/read` and `prompts/get`) a tape append failed after an oversized upstream response was already dispatched. |
 | `-32002` | `UpstreamTimeout` | Upstream MCP call exceeded its configured `timeout_ms`. |
 | `-32003` | `UpstreamUnavailable` | Upstream MCP server is unreachable, crashed (`stdio`), or its circuit breaker is `Open`. |
 | `-32004` | `BudgetExceeded` | Per-principal / per-server `max_calls_per_minute` or `max_concurrent_calls` limit exceeded. |

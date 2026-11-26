@@ -785,41 +785,84 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
                 });
             }
         }
+    } else if tape_path
+        .to_string_lossy()
+        .ends_with(['/', std::path::MAIN_SEPARATOR])
+        || tape_path.file_name().is_none()
+    {
+        failures += 1;
+        checks.push(DoctorCheck {
+            status: "FAIL",
+            name: "Tape Path".to_owned(),
+            detail: format!(
+                "tape path '{}' must point to a file, not a directory",
+                tape_path.display()
+            ),
+        });
+        checks.push(DoctorCheck {
+            status: "SKIP",
+            name: "Tape Integrity".to_owned(),
+            detail: format!("'{}' does not exist yet", tape_path.display()),
+        });
     } else {
         let parent = match tape_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
-        let probe_path = parent.join(format!(".keelway-doctor-probe-{}", std::process::id()));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe_path)
-        {
-            Ok(file) => {
-                drop(file);
-                let _ = fs::remove_file(&probe_path);
-                checks.push(DoctorCheck {
-                    status: "PASS",
-                    name: "Tape Path".to_owned(),
-                    detail: format!(
-                        "parent '{}' is writable for '{}'",
-                        parent.display(),
-                        tape_path.display()
-                    ),
-                });
+        let mut probe_dir = parent;
+        while !probe_dir.exists() {
+            match probe_dir.parent() {
+                Some(next) if !next.as_os_str().is_empty() => probe_dir = next,
+                _ => {
+                    probe_dir = Path::new(".");
+                    break;
+                }
             }
-            Err(e) => {
-                failures += 1;
-                checks.push(DoctorCheck {
-                    status: "FAIL",
-                    name: "Tape Path".to_owned(),
-                    detail: format!(
-                        "parent '{}' is not writable for '{}': {e}",
-                        parent.display(),
-                        tape_path.display()
-                    ),
-                });
+        }
+        if !probe_dir.is_dir() {
+            failures += 1;
+            checks.push(DoctorCheck {
+                status: "FAIL",
+                name: "Tape Path".to_owned(),
+                detail: format!(
+                    "ancestor '{}' is not a directory for '{}'",
+                    probe_dir.display(),
+                    tape_path.display()
+                ),
+            });
+        } else {
+            let probe_path =
+                probe_dir.join(format!(".keelway-doctor-probe-{}", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe_path)
+            {
+                Ok(file) => {
+                    drop(file);
+                    let _ = fs::remove_file(&probe_path);
+                    checks.push(DoctorCheck {
+                        status: "PASS",
+                        name: "Tape Path".to_owned(),
+                        detail: format!(
+                            "writable ancestor '{}' verified for '{}'",
+                            probe_dir.display(),
+                            tape_path.display()
+                        ),
+                    });
+                }
+                Err(e) => {
+                    failures += 1;
+                    checks.push(DoctorCheck {
+                        status: "FAIL",
+                        name: "Tape Path".to_owned(),
+                        detail: format!(
+                            "ancestor '{}' is not writable for '{}': {e}",
+                            probe_dir.display(),
+                            tape_path.display()
+                        ),
+                    });
+                }
             }
         }
         checks.push(DoctorCheck {
@@ -2008,6 +2051,36 @@ policy_files:
             "unexpected error: {err}"
         );
 
+        let trailing_slash_cfg = dir.join("trailing-slash-tape.yaml");
+        fs::write(
+            &trailing_slash_cfg,
+            format!(
+                r#"bind_addr: "127.0.0.1:8080"
+tape_path: "{tape}/"
+policy_files:
+  - "policies/simple.cedar"
+"#,
+                tape = dir.join("audit").display()
+            ),
+        )?;
+        assert!(run_doctor(&trailing_slash_cfg).is_err());
+
+        let blocking_file = dir.join("not-a-dir");
+        fs::write(&blocking_file, "file")?;
+        let blocked_cfg = dir.join("blocked-tape-dir.yaml");
+        fs::write(
+            &blocked_cfg,
+            format!(
+                r#"bind_addr: "127.0.0.1:8080"
+tape_path: "{tape}"
+policy_files:
+  - "policies/simple.cedar"
+"#,
+                tape = blocking_file.join("sub/keelway-tape.jsonl").display()
+            ),
+        )?;
+        assert!(run_doctor(&blocked_cfg).is_err());
+
         let missing_dir_tape = dir.join("missing-subdir/keelway-tape.jsonl");
         let missing_cfg = dir.join("missing-tape-dir.yaml");
         fs::write(
@@ -2021,7 +2094,8 @@ policy_files:
                 tape = missing_dir_tape.display()
             ),
         )?;
-        assert!(run_doctor(&missing_cfg).is_err());
+        assert_eq!(run_doctor(&missing_cfg)?, ExitCode::SUCCESS);
+        assert!(!dir.join("missing-subdir").exists());
 
         let good_cfg = dir.join("good-tape.yaml");
         fs::write(
