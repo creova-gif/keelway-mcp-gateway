@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use axum::{Json, Router};
-use keelway_engine::core::{Decision, GatewayConfig, KeelwayError};
+use keelway_engine::core::{Decision, GatewayConfig, KeelwayError, PromptConfig, ResourceConfig};
 use keelway_engine::{
     ApprovalRule, BudgetRule, ExecutionOutcome, GatewayEngine, PrincipalConfig, Receipt,
     ReceiptState, ReplayVerdict, SecretProvider, ServerConfig, UpstreamTransport, ValidatorBinding,
@@ -152,6 +152,8 @@ async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Res
                 alias: "github".to_owned(),
                 timeout_ms: 5_000,
                 tools: vec!["read_repository".to_owned(), "delete_repository".to_owned()],
+                resources: vec![],
+                prompts: vec![],
                 transport: UpstreamTransport::StreamableHttp {
                     url: github_url,
                     headers: gh_headers,
@@ -161,6 +163,8 @@ async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Res
                 alias: "database".to_owned(),
                 timeout_ms: 5_000,
                 tools: vec!["query_readonly".to_owned()],
+                resources: vec![],
+                prompts: vec![],
                 transport: UpstreamTransport::StreamableHttp {
                     url: db_url,
                     headers: BTreeMap::new(),
@@ -170,6 +174,8 @@ async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Res
                 alias: "filesystem".to_owned(),
                 timeout_ms: 5_000,
                 tools: vec!["read_file".to_owned()],
+                resources: vec![],
+                prompts: vec![],
                 transport: UpstreamTransport::StreamableHttp {
                     url: fs_url,
                     headers: BTreeMap::new(),
@@ -397,6 +403,8 @@ async fn stdio_upstream_federation_injects_env_and_scrubs_stdout_and_stderr()
             alias: "localstdio".to_owned(),
             timeout_ms: 5_000,
             tools: vec!["echo_secret".to_owned()],
+            resources: vec![],
+            prompts: vec![],
             transport: UpstreamTransport::Stdio {
                 command: "sh".to_owned(),
                 args: vec!["-c".to_owned(), script.to_owned()],
@@ -489,6 +497,8 @@ async fn stdio_upstream_timeout_returns_32002_and_records_timeout_receipt()
             alias: "slowstdio".to_owned(),
             timeout_ms: 50,
             tools: vec!["hang_tool".to_owned()],
+            resources: vec![],
+            prompts: vec![],
             transport: UpstreamTransport::Stdio {
                 command: "sh".to_owned(),
                 args: vec!["-c".to_owned(), "sleep 2".to_owned()],
@@ -572,6 +582,8 @@ async fn stdio_upstream_crash_returns_32003_and_records_crashed_receipt() -> Res
             alias: "crashstdio".to_owned(),
             timeout_ms: 5_000,
             tools: vec!["crash_tool".to_owned()],
+            resources: vec![],
+            prompts: vec![],
             transport: UpstreamTransport::Stdio {
                 command: "sh".to_owned(),
                 args: vec!["-c".to_owned(), "exit 1".to_owned()],
@@ -795,6 +807,8 @@ async fn execution_budget_blocks_excess_calls_with_32004_and_records_deny_receip
             alias: "database".to_owned(),
             timeout_ms: 5_000,
             tools: vec!["query_readonly".to_owned()],
+            resources: vec![],
+            prompts: vec![],
             transport: UpstreamTransport::StreamableHttp {
                 url: db_url,
                 headers: BTreeMap::new(),
@@ -904,6 +918,8 @@ async fn stdio_child_env_clear_isolates_inherited_host_secrets() -> Result<(), K
             alias: "envstdio".to_owned(),
             timeout_ms: 5_000,
             tools: vec!["check_env".to_owned()],
+            resources: vec![],
+            prompts: vec![],
             transport: UpstreamTransport::Stdio {
                 command: "sh".to_owned(),
                 args: vec!["-c".to_owned(), script.to_owned()],
@@ -997,6 +1013,8 @@ async fn p10_human_gate_and_observability_endpoints_work_end_to_end() -> Result<
             alias: "database".to_owned(),
             timeout_ms: 5_000,
             tools: vec!["query_readonly".to_owned()],
+            resources: vec![],
+            prompts: vec![],
             transport: UpstreamTransport::StreamableHttp {
                 url: db_url,
                 headers: BTreeMap::new(),
@@ -1202,6 +1220,8 @@ async fn payload_size_guardrails_block_oversized_requests_and_responses() -> Res
             },
             timeout_ms: 5_000,
             tools: vec!["ping".to_owned()],
+            resources: vec![],
+            prompts: vec![],
         }],
         ..Default::default()
     };
@@ -1340,6 +1360,8 @@ async fn ed25519_signed_tape_and_traceparent_provenance_work_end_to_end() -> Res
             },
             timeout_ms: 5_000,
             tools: vec!["ping".to_owned()],
+            resources: vec![],
+            prompts: vec![],
         }],
         signing_key_ref: Some("secret://signing_seed".to_owned()),
         ..Default::default()
@@ -1528,6 +1550,30 @@ async fn mcp_lifecycle_and_resource_prompt_governance_work_end_to_end() -> Resul
                 )]),
             },
             tools: vec!["ping".to_owned()],
+            resources: vec![
+                ResourceConfig {
+                    uri: "docs://allowed.md".to_owned(),
+                    name: Some("Allowed Doc".to_owned()),
+                    description: Some("Permitted markdown document".to_owned()),
+                    mime_type: Some("text/markdown".to_owned()),
+                },
+                ResourceConfig {
+                    uri: "docs://forbidden.md".to_owned(),
+                    name: Some("Forbidden Doc".to_owned()),
+                    description: None,
+                    mime_type: None,
+                },
+            ],
+            prompts: vec![
+                PromptConfig {
+                    name: "summarize".to_owned(),
+                    description: Some("Summarize a document".to_owned()),
+                },
+                PromptConfig {
+                    name: "admin_reset".to_owned(),
+                    description: Some("Restricted admin prompt".to_owned()),
+                },
+            ],
             timeout_ms: 5000,
         }],
         ..GatewayConfig::default()
@@ -1609,7 +1655,7 @@ permit (
             .is_empty()
     );
 
-    // 3. resources/list and prompts/list return empty lists
+    // 3. resources/list and prompts/list return only Cedar-permitted items
     let res_list: Value = client
         .post(&url)
         .header("authorization", "Bearer tok-lifecycle")
@@ -1620,7 +1666,15 @@ permit (
         .json()
         .await
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
-    assert_eq!(res_list["result"]["resources"], json!([]));
+    assert_eq!(
+        res_list["result"]["resources"],
+        json!([{
+            "uri": "docs://allowed.md",
+            "name": "Allowed Doc",
+            "description": "Permitted markdown document",
+            "mimeType": "text/markdown"
+        }])
+    );
 
     let prompt_list: Value = client
         .post(&url)
@@ -1632,7 +1686,13 @@ permit (
         .json()
         .await
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
-    assert_eq!(prompt_list["result"]["prompts"], json!([]));
+    assert_eq!(
+        prompt_list["result"]["prompts"],
+        json!([{
+            "name": "summarize",
+            "description": "Summarize a document"
+        }])
+    );
 
     // 4. Default-deny on unpermitted resources/read
     let denied_read: Value = client
@@ -1753,6 +1813,122 @@ permit (
             ),
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn jwt_bearer_authentication_governs_mcp_requests_end_to_end() -> Result<(), KeelwayError> {
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use keelway_engine::auth::JwtConfig;
+
+    let tmp = tempfile::tempdir()?;
+    let tape_path = tmp.path().join("jwt-e2e-tape.jsonl");
+    let hs256_secret = "super-secret-hs256-signing-key-at-least-32-bytes";
+
+    let upstream = Router::new().route(
+        "/mcp",
+        post(|Json(body): Json<Value>| async move {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "content": [{ "type": "text", "text": "jwt-ok" }] }
+            }))
+        }),
+    );
+    let up_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let up_addr = up_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(up_listener, upstream).await;
+    });
+
+    let cfg = GatewayConfig {
+        servers: vec![ServerConfig {
+            alias: "echo".to_owned(),
+            transport: UpstreamTransport::StreamableHttp {
+                url: format!("http://{up_addr}/mcp"),
+                headers: BTreeMap::new(),
+            },
+            timeout_ms: 5_000,
+            tools: vec!["ping".to_owned()],
+            resources: vec![],
+            prompts: vec![],
+        }],
+        jwt_auth: Some(JwtConfig {
+            issuer: "https://idp.example.com".to_owned(),
+            audience: "keelway-gw".to_owned(),
+            hs256_secret: Some("secret://jwt_hs256".to_owned()),
+            ed25519_public_key_hex: None,
+            jwks_url: None,
+            org_claim: "org_id".to_owned(),
+            agent_claim: "agent_id".to_owned(),
+            roles_claim: "roles".to_owned(),
+        }),
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"echo/ping"
+);
+"#;
+    let mut secrets = HashMap::new();
+    secrets.insert("secret://jwt_hs256".to_owned(), hs256_secret.to_owned());
+
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(secrets))?;
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let now = chrono::Utc::now().timestamp() as usize;
+    let valid_token = encode(
+        &Header::default(),
+        &json!({
+            "iss": "https://idp.example.com",
+            "aud": "keelway-gw",
+            "exp": now + 300,
+            "org_id": "acme",
+            "agent_id": "jwt-agent",
+            "roles": ["developer"]
+        }),
+        &EncodingKey::from_secret(hs256_secret.as_bytes()),
+    )
+    .map_err(|e| KeelwayError::Auth(e.to_string()))?;
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    let ok_resp: Value = client
+        .post(&gw_url)
+        .header("authorization", format!("Bearer {valid_token}"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "echo__ping", "arguments": {} }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(ok_resp["result"]["content"][0]["text"], "jwt-ok");
+
+    let bad_resp = client
+        .post(&gw_url)
+        .header("authorization", "Bearer invalid.jwt.token")
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(bad_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     Ok(())
 }

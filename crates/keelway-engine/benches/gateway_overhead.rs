@@ -99,6 +99,8 @@ fn run_bench() -> Result<(), KeelwayError> {
                 alias: "github".to_owned(),
                 timeout_ms: 30_000,
                 tools: vec!["read_repository".to_owned(), "delete_repository".to_owned()],
+                resources: vec![],
+                prompts: vec![],
                 transport: UpstreamTransport::Stdio {
                     command: "echo".to_owned(),
                     args: vec![],
@@ -109,6 +111,8 @@ fn run_bench() -> Result<(), KeelwayError> {
                 alias: "database".to_owned(),
                 timeout_ms: 30_000,
                 tools: vec!["query_readonly".to_owned()],
+                resources: vec![],
+                prompts: vec![],
                 transport: UpstreamTransport::Stdio {
                     command: "echo".to_owned(),
                     args: vec![],

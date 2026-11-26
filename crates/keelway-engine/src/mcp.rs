@@ -1,8 +1,9 @@
+use crate::auth::JwtVerifier;
 use crate::budget::BudgetTracker;
 use crate::core::{
-    Decision, ExecutionOutcome, Explanation, GatewayConfig, KeelwayError, Principal, ReceiptState,
-    ServerConfig, ToolCall, UnsealedReceipt, UpstreamTransport, sanitize_federated_name,
-    validate_server_alias,
+    Decision, ExecutionOutcome, Explanation, GatewayConfig, KeelwayError, Principal, PromptConfig,
+    ReceiptState, ResourceConfig, ServerConfig, ToolCall, UnsealedReceipt, UpstreamTransport,
+    sanitize_federated_name, validate_server_alias,
 };
 use crate::metrics::{EventOutcome, GatewayMetrics, LiveConsoleEvent};
 use crate::p10::P10GateManager;
@@ -401,7 +402,10 @@ pub struct GatewayRuntime {
     p10: P10GateManager,
     metrics: Arc<GatewayMetrics>,
     token_map: HashMap<String, Principal>,
+    jwt_verifier: Option<JwtVerifier>,
     upstreams: HashMap<String, UpstreamDriver>,
+    resources: Vec<(String, ResourceConfig)>,
+    prompts: Vec<(String, PromptConfig)>,
     console_to_stderr: bool,
     max_request_bytes: usize,
     max_response_bytes: usize,
@@ -430,6 +434,8 @@ impl GatewayRuntime {
 
         let mut upstreams = HashMap::new();
         let mut federated_tools = Vec::new();
+        let mut resources = Vec::new();
+        let mut prompts = Vec::new();
 
         for s in &config.servers {
             validate_server_alias(&s.alias)?;
@@ -446,7 +452,28 @@ impl GatewayRuntime {
                     input_schema: json!({ "type": "object" }),
                 });
             }
+            for r in &s.resources {
+                resources.push((s.alias.clone(), r.clone()));
+            }
+            for p in &s.prompts {
+                prompts.push((s.alias.clone(), p.clone()));
+            }
         }
+
+        let jwt_verifier = match config.jwt_auth {
+            Some(ref jwt_cfg) => {
+                let mut resolved_cfg = jwt_cfg.clone();
+                if let Some(ref secret_ref) = resolved_cfg.hs256_secret
+                    && secret_ref.starts_with("secret://")
+                {
+                    let resolved = secrets.resolve(secret_ref)?;
+                    collected_secrets.push(resolved.clone());
+                    resolved_cfg.hs256_secret = Some(resolved);
+                }
+                Some(JwtVerifier::new(resolved_cfg)?)
+            }
+            None => None,
+        };
 
         let registry = ToolRegistry::build(federated_tools)?;
         let scrubber = Arc::new(
@@ -466,7 +493,10 @@ impl GatewayRuntime {
             p10,
             metrics,
             token_map,
+            jwt_verifier,
             upstreams,
+            resources,
+            prompts,
             console_to_stderr,
             max_request_bytes: config.max_request_bytes,
             max_response_bytes: config.max_response_bytes,
@@ -480,6 +510,19 @@ impl GatewayRuntime {
             return None;
         }
         self.token_map.get(token).cloned()
+    }
+
+    /// Authenticates static bearer tokens first, then falls back to stateless JWT/OIDC verification.
+    pub async fn authenticate_bearer_async(&self, auth_header: Option<&str>) -> Option<Principal> {
+        if let Some(principal) = self.authenticate_bearer(auth_header) {
+            return Some(principal);
+        }
+        let verifier = self.jwt_verifier.as_ref()?;
+        let token = auth_header?.strip_prefix("Bearer ")?.trim();
+        if token.is_empty() {
+            return None;
+        }
+        verifier.verify_token(token).await.ok()
     }
 
     /// Processes a single MCP JSON-RPC 2.0 request for an authenticated `principal`.
@@ -519,16 +562,59 @@ impl GatewayRuntime {
                 "id": id,
                 "result": {}
             }),
-            "resources/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "resources": [] }
-            }),
-            "prompts/list" => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "prompts": [] }
-            }),
+            "resources/list" => {
+                let visible: Vec<Value> = self
+                    .resources
+                    .iter()
+                    .filter(|(server, r)| {
+                        self.policy
+                            .can_perform_action(principal, "read_resource", server, &r.uri)
+                    })
+                    .map(|(_, r)| {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("uri".to_owned(), json!(r.uri));
+                        obj.insert(
+                            "name".to_owned(),
+                            json!(r.name.as_deref().unwrap_or(&r.uri)),
+                        );
+                        if let Some(ref desc) = r.description {
+                            obj.insert("description".to_owned(), json!(desc));
+                        }
+                        if let Some(ref mime) = r.mime_type {
+                            obj.insert("mimeType".to_owned(), json!(mime));
+                        }
+                        Value::Object(obj)
+                    })
+                    .collect();
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "resources": visible }
+                })
+            }
+            "prompts/list" => {
+                let visible: Vec<Value> = self
+                    .prompts
+                    .iter()
+                    .filter(|(server, p)| {
+                        self.policy
+                            .can_perform_action(principal, "get_prompt", server, &p.name)
+                    })
+                    .map(|(_, p)| {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("name".to_owned(), json!(p.name));
+                        if let Some(ref desc) = p.description {
+                            obj.insert("description".to_owned(), json!(desc));
+                        }
+                        Value::Object(obj)
+                    })
+                    .collect();
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "prompts": visible }
+                })
+            }
             "tools/list" => {
                 let visible: Vec<Value> = self
                     .registry
@@ -1667,7 +1753,7 @@ async fn events_sse_handler(
     headers: HeaderMap,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
+    let Some(principal) = runtime.authenticate_bearer_async(auth_header).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthenticated" })),
@@ -1713,7 +1799,7 @@ async fn p10_pending_handler(
     headers: HeaderMap,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
+    let Some(principal) = runtime.authenticate_bearer_async(auth_header).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthenticated" })),
@@ -1748,7 +1834,7 @@ async fn p10_resolve_handler(
     Json(body): Json<P10ResolveBody>,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
+    let Some(principal) = runtime.authenticate_bearer_async(auth_header).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthenticated" })),
@@ -1786,7 +1872,7 @@ async fn http_mcp_handler(
     Json(body): Json<Value>,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let Some(principal) = runtime.authenticate_bearer(auth_header) else {
+    let Some(principal) = runtime.authenticate_bearer_async(auth_header).await else {
         // Record unauthenticated DENY receipt (best-effort; always return 401 fail-closed)
         let _ = runtime
             .tape

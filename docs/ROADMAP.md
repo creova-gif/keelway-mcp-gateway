@@ -23,7 +23,7 @@ Keelway MCP Gateway is a high-assurance security and governance proxy for Model 
 
 ---
 
-## Milestone 3 — Cryptographic Provenance, Operator Console & Production Guardrails (Shipped)
+## Milestone 3 — Cryptographic Provenance, Operator Console & Production Guardrails (Shipped, v0.3.0)
 
 - **M3A — Payload Limits & Unregistered Egress Scrubbing:**
   - Configurable `max_request_bytes` and `max_response_bytes` enforcement failing closed with JSON-RPC `-32006 PayloadTooLarge` to prevent memory exhaustion and oversized-payload bypasses.
@@ -37,9 +37,14 @@ Keelway MCP Gateway is a high-assurance security and governance proxy for Model 
 
 ---
 
-## Milestone 4 — Distributed Control Plane & Enterprise Policy Ecosystem (Planned)
+## Milestone 4 — Distributed Control Plane & Enterprise Policy Ecosystem (In Progress)
 
-- **OIDC/JWT & mTLS Principal Federation:** Cryptographic principal authentication with external IdP JWKS verification and mutual TLS client identity binding.
-- **Distributed Governance State:** Redis/Postgres-backed execution budget counters and P-10 approval gate state enabling horizontal multi-replica gateway deployments.
-- **Signed Policy Bundle Distribution:** Remote policy registry synchronization with cryptographic signature verification for centralized Cedar and validator bundle rollouts.
-- **Full MCP Primitive Governance:** Extend policy evaluation, scrubbing, and audit receipts beyond `tools/call` to `resources/read` and `prompts/get`.
+- **M4A (MCP Resources/Prompts & CLI Keygen) — Shipped (v0.3.0):**
+  - Policy evaluation, egress scrubbing, and audit tape coverage extended beyond `tools/call` to MCP `ping`, `resources/*`, and `prompts/*` primitives.
+  - `keelway keygen` CLI command for generating Ed25519 signing keypairs.
+- **M4B (OIDC/JWT Principal Federation) — In Progress:**
+  - Cryptographic bearer principal authentication with external IdP JWKS verification.
+  - Declared MCP `resources/list` and `prompts/list` discovery.
+- **mTLS Principal Identity Binding (Planned):** Mutual TLS client identity binding for federated principals.
+- **Distributed Governance State (Planned):** Redis/Postgres-backed execution budget counters and P-10 approval gate state enabling horizontal multi-replica gateway deployments.
+- **Signed Policy Bundle Distribution (Planned):** Remote policy registry synchronization with cryptographic signature verification for centralized Cedar and validator bundle rollouts.

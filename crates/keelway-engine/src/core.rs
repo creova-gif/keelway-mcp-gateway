@@ -185,6 +185,8 @@ pub struct GatewayConfig {
     pub egress_pattern_scrubbing: bool,
     #[serde(default)]
     pub signing_key_ref: Option<String>,
+    #[serde(default)]
+    pub jwt_auth: Option<crate::auth::JwtConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -202,6 +204,7 @@ impl Default for GatewayConfig {
             max_response_bytes: default_max_response_bytes(),
             egress_pattern_scrubbing: default_egress_pattern_scrubbing(),
             signing_key_ref: None,
+            jwt_auth: None,
         }
     }
 }
@@ -288,6 +291,26 @@ impl PrincipalConfig {
     }
 }
 
+/// Static resource declaration for `resources/list` discovery and Cedar filtering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceConfig {
+    pub uri: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+/// Static prompt declaration for `prompts/list` discovery and Cedar filtering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptConfig {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// Upstream MCP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -298,6 +321,12 @@ pub struct ServerConfig {
     /// Optional static tool catalog used for offline `policy test` / `attack simulate` / `replay`.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Optional static resource catalog for `resources/list` discovery.
+    #[serde(default)]
+    pub resources: Vec<ResourceConfig>,
+    /// Optional static prompt catalog for `prompts/list` discovery.
+    #[serde(default)]
+    pub prompts: Vec<PromptConfig>,
 }
 
 fn default_timeout_ms() -> u64 {

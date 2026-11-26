@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **OIDC/JWT Bearer Principal Federation**: Cryptographic principal authentication using external IdP JWKS verification for incoming bearer tokens *(Milestone 4B, in progress)*.
+- **Declared MCP `resources/list` & `prompts/list` Discovery**: Principal-scoped discovery for declared MCP resources and prompts *(Milestone 4B, in progress)*.
+
+## [0.3.0] - 2026-11-26
+
+### Added
 - **Embedded Operator Console (`GET /ui`)**: Zero-dependency HTML/JS operator console served directly from the gateway binary with a live SSE decision stream, interactive P-10 approval queue, and Prometheus metric summary cards ([ADR-007](docs/adr/007-embedded-operator-console.md)).
 - **Ed25519 Signed Tape Provenance & W3C `traceparent`**: Optional Ed25519 receipt signing (`signing_key_ref`) with verifiable offline attestation (`keelway trace inspect --public-key <HEX>`), `keelway keygen` for generating signing keypairs, and W3C `traceparent` propagation/correlation across gateway spans, upstream calls, and audit receipts ([ADR-006](docs/adr/006-ed25519-tape-provenance-and-doctor.md)).
 - **Preflight Diagnostics (`keelway doctor`)**: Offline pre-flight validation of configuration schemas, Cedar policies, secret provider bindings, and security posture ([ADR-006](docs/adr/006-ed25519-tape-provenance-and-doctor.md)).
@@ -36,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OS-Thread SHA-256 Audit Tape**: Dedicated OS-thread group-commit (`sync_data()`) hash-chained `keelway-tape.jsonl` writer that fails closed (`-32001`) on persistence errors and verifies the full chain in O(1) memory on startup.
 - **Offline Policy Testbench**: `keelway init`, `keelway policy test`, `keelway attack simulate`, `keelway trace inspect`, and `keelway replay --dry-run`.
 
-[Unreleased]: https://github.com/creova-gif/keelway-mcp-gateway/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/creova-gif/keelway-mcp-gateway/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/creova-gif/keelway-mcp-gateway/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/creova-gif/keelway-mcp-gateway/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/creova-gif/keelway-mcp-gateway/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/creova-gif/keelway-mcp-gateway/releases/tag/v0.1.0

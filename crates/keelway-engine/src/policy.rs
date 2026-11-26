@@ -119,27 +119,40 @@ impl PolicyEngine {
         self.snapshot.load().inspected_arg_pointers(server, tool)
     }
 
-    /// Evaluates whether `principal` is permitted to discover `(server, tool)` in `tools/list`.
-    pub fn can_list_tool(&self, principal: &Principal, server: &str, tool: &str) -> bool {
+    /// Evaluates whether `principal` is permitted to perform `action_name` on `(server, target)`.
+    pub fn can_perform_action(
+        &self,
+        principal: &Principal,
+        action_name: &str,
+        server: &str,
+        target: &str,
+    ) -> bool {
         let snap = self.snapshot.load();
         let Ok(req) = build_cedar_request(
             principal,
-            "list_tool",
+            action_name,
             server,
-            tool,
+            target,
             &BTreeMap::new(),
             &snap.validators,
             &snap.schema,
         ) else {
             return false;
         };
-        let Ok(entities) = entities_with_tool(&snap.entities, &snap.schema, server, tool) else {
+        let Ok(entities) =
+            entities_for_request(&snap.entities, &snap.schema, principal, server, target)
+        else {
             return false;
         };
         let resp = self
             .authorizer
             .is_authorized(&req, &snap.policy_set, entities.as_ref());
         matches!(resp.decision(), CedarDecision::Allow)
+    }
+
+    /// Evaluates whether `principal` is permitted to discover `(server, tool)` in `tools/list`.
+    pub fn can_list_tool(&self, principal: &Principal, server: &str, tool: &str) -> bool {
+        self.can_perform_action(principal, "list_tool", server, tool)
     }
 
     /// Evaluates a `tools/call` invocation through Stage 1 (5 typed validators) and Stage 2 (Cedar).
@@ -186,7 +199,13 @@ impl PolicyEngine {
             &snap.validators,
             &snap.schema,
         )?;
-        let entities = entities_with_tool(&snap.entities, &snap.schema, &call.server, &call.tool)?;
+        let entities = entities_for_request(
+            &snap.entities,
+            &snap.schema,
+            principal,
+            &call.server,
+            &call.tool,
+        )?;
         let resp = self
             .authorizer
             .is_authorized(&req, &snap.policy_set, entities.as_ref());
@@ -520,36 +539,79 @@ fn build_static_entities(
         .map_err(|e| KeelwayError::Policy(format!("failed to build cedar entities: {e}")))
 }
 
-/// Ensures a `Tool` entity with `server` and `name` attributes exists for `(server, tool)`,
-/// supporting dynamically addressed `resources/read` URIs and `prompts/get` names.
-fn entities_with_tool<'a>(
+/// Ensures `Agent` (with `Role` parents for stateless JWT principals) and `Tool` entities
+/// exist for the current request, borrowing `base` when all entities are already present.
+fn entities_for_request<'a>(
     base: &'a Entities,
     schema: &Schema,
+    principal: &Principal,
     server: &str,
     tool: &str,
 ) -> Result<Cow<'a, Entities>, KeelwayError> {
+    let role_type = EntityTypeName::from_str("Role")
+        .map_err(|e| KeelwayError::Policy(format!("entity type Role error: {e}")))?;
+    let agent_type = EntityTypeName::from_str("Agent")
+        .map_err(|e| KeelwayError::Policy(format!("entity type Agent error: {e}")))?;
     let tool_type = EntityTypeName::from_str("Tool")
         .map_err(|e| KeelwayError::Policy(format!("entity type Tool error: {e}")))?;
-    let uid =
+
+    let agent_uid = EntityUid::from_type_name_and_id(
+        agent_type,
+        EntityId::new(format!("{}/{}", principal.org_id, principal.agent_id)),
+    );
+    let tool_uid =
         EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
-    if base.get(&uid).is_some() {
+
+    let mut additions = Vec::new();
+    if base.get(&agent_uid).is_none() {
+        let mut parents = HashSet::new();
+        for role in &principal.roles {
+            let role_uid =
+                EntityUid::from_type_name_and_id(role_type.clone(), EntityId::new(role.clone()));
+            if base.get(&role_uid).is_none() {
+                let role_ent = Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())
+                    .map_err(|e| KeelwayError::Policy(format!("dynamic role entity error: {e}")))?;
+                additions.push(role_ent);
+            }
+            parents.insert(role_uid);
+        }
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "org_id".to_owned(),
+            RestrictedExpression::new_string(principal.org_id.clone()),
+        );
+        attrs.insert(
+            "agent_id".to_owned(),
+            RestrictedExpression::new_string(principal.agent_id.clone()),
+        );
+        let agent_ent = Entity::new(agent_uid, attrs, parents)
+            .map_err(|e| KeelwayError::Policy(format!("dynamic agent entity error: {e}")))?;
+        additions.push(agent_ent);
+    }
+
+    if base.get(&tool_uid).is_none() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "server".to_owned(),
+            RestrictedExpression::new_string(server.to_owned()),
+        );
+        attrs.insert(
+            "name".to_owned(),
+            RestrictedExpression::new_string(tool.to_owned()),
+        );
+        let tool_ent = Entity::new(tool_uid, attrs, HashSet::new())
+            .map_err(|e| KeelwayError::Policy(format!("dynamic tool entity error: {e}")))?;
+        additions.push(tool_ent);
+    }
+
+    if additions.is_empty() {
         return Ok(Cow::Borrowed(base));
     }
-    let mut attrs = HashMap::new();
-    attrs.insert(
-        "server".to_owned(),
-        RestrictedExpression::new_string(server.to_owned()),
-    );
-    attrs.insert(
-        "name".to_owned(),
-        RestrictedExpression::new_string(tool.to_owned()),
-    );
-    let ent = Entity::new(uid, attrs, HashSet::new())
-        .map_err(|e| KeelwayError::Policy(format!("dynamic tool entity error: {e}")))?;
+
     let updated = base
         .clone()
-        .add_entities(std::iter::once(ent), Some(schema))
-        .map_err(|e| KeelwayError::Policy(format!("failed to add dynamic tool entity: {e}")))?;
+        .add_entities(additions, Some(schema))
+        .map_err(|e| KeelwayError::Policy(format!("failed to add dynamic entities: {e}")))?;
     Ok(Cow::Owned(updated))
 }
 
@@ -817,6 +879,8 @@ mod tests {
                     },
                     timeout_ms: 30_000,
                     tools: vec!["read_repository".to_owned(), "delete_repository".to_owned()],
+                    resources: vec![],
+                    prompts: vec![],
                 },
                 ServerConfig {
                     alias: "database".to_owned(),
@@ -827,6 +891,8 @@ mod tests {
                     },
                     timeout_ms: 30_000,
                     tools: vec!["query_readonly".to_owned()],
+                    resources: vec![],
+                    prompts: vec![],
                 },
                 ServerConfig {
                     alias: "filesystem".to_owned(),
@@ -837,6 +903,8 @@ mod tests {
                     },
                     timeout_ms: 30_000,
                     tools: vec!["read_file".to_owned()],
+                    resources: vec![],
+                    prompts: vec![],
                 },
             ],
             validators: vec![

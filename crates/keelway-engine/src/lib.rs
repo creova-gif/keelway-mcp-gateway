@@ -1,3 +1,4 @@
+pub mod auth;
 pub(crate) mod budget;
 pub mod core;
 pub(crate) mod mcp;
