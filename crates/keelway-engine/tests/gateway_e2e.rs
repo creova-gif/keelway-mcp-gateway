@@ -1407,3 +1407,49 @@ permit(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn operator_console_ui_serves_html_with_security_headers() -> Result<(), KeelwayError> {
+    let tmp = tempfile::tempdir()?;
+    let tape_path = tmp.path().join("ui-tape.jsonl");
+    let cfg = GatewayConfig::default();
+    let engine = GatewayEngine::from_in_memory(cfg, "")?;
+    let router = engine.build_test_http_router(tape_path, &MapSecrets(HashMap::new()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/ui"))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let headers = resp.headers().clone();
+    assert_eq!(
+        headers.get("x-frame-options").and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert!(
+        headers
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("default-src 'self'"))
+    );
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert!(body.contains("Keelway"));
+    assert!(body.contains("/p10/pending"));
+
+    Ok(())
+}

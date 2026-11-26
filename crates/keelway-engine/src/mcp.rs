@@ -1123,12 +1123,36 @@ pub fn build_http_router(runtime: Arc<GatewayRuntime>) -> Router {
     Router::new()
         .route("/mcp", post(http_mcp_handler))
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .route("/ui", get(ui_console_handler))
         .route("/healthz", get(healthz_handler))
         .route("/metrics", get(metrics_handler))
         .route("/events", get(events_sse_handler))
         .route("/p10/pending", get(p10_pending_handler))
         .route("/p10/resolve", post(p10_resolve_handler))
         .with_state(runtime)
+}
+
+const CONSOLE_HTML: &str = include_str!("ui/console.html");
+
+async fn ui_console_handler() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8",
+            ),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+            ),
+            (axum::http::header::X_FRAME_OPTIONS, "DENY"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        CONSOLE_HTML,
+    )
+        .into_response()
 }
 
 async fn healthz_handler() -> Response {

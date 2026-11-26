@@ -23,7 +23,7 @@ Keelway MCP Gateway is a high-assurance security and governance proxy for Model 
 
 ---
 
-## Milestone 3 — Cryptographic Provenance, Operator Console & Production Guardrails (In Progress)
+## Milestone 3 — Cryptographic Provenance, Operator Console & Production Guardrails (Shipped)
 
 - **M3A — Payload Limits & Unregistered Egress Scrubbing:**
   - Configurable `max_request_bytes` and `max_response_bytes` enforcement failing closed with JSON-RPC `-32006 PayloadTooLarge` to prevent memory exhaustion and oversized-payload bypasses.

@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+  <title>Keelway MCP Gateway — Operator Console</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --surface: #121722;
+      --surface-alt: #181f2e;
+      --border: #263044;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --ok: #22c55e;
+      --ok-bg: rgba(34, 197, 94, 0.14);
+      --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.14);
+      --err: #ef4444;
+      --err-bg: rgba(239, 68, 68, 0.14);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    header.topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: 0.01em;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--muted);
+    }
+
+    .status-pill[data-state="connected"] {
+      color: var(--ok);
+      border-color: rgba(34, 197, 94, 0.4);
+      background: var(--ok-bg);
+    }
+
+    .status-pill[data-state="error"] {
+      color: var(--err);
+      border-color: rgba(239, 68, 68, 0.4);
+      background: var(--err-bg);
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .auth-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    input[type="password"],
+    input[type="text"] {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      width: 280px;
+      max-width: 100%;
+    }
+
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    button {
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      transition: background 0.12s ease, border-color 0.12s ease;
+    }
+
+    button:hover:not(:disabled) {
+      background: #222b3e;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #ffffff;
+    }
+
+    button.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+
+    button.approve {
+      background: var(--ok-bg);
+      border-color: rgba(34, 197, 94, 0.45);
+      color: var(--ok);
+    }
+
+    button.approve:hover:not(:disabled) {
+      background: rgba(34, 197, 94, 0.24);
+    }
+
+    button.deny {
+      background: var(--err-bg);
+      border-color: rgba(239, 68, 68, 0.45);
+      color: var(--err);
+    }
+
+    button.deny:hover:not(:disabled) {
+      background: rgba(239, 68, 68, 0.24);
+    }
+
+    main {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .section-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+
+    .section-meta {
+      font-size: 12px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+    }
+
+    .metric-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+
+    .metric-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 6px;
+    }
+
+    .metric-value {
+      font-family: var(--mono);
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .metric-card[data-tone="ok"] .metric-value { color: var(--ok); }
+    .metric-card[data-tone="warn"] .metric-value { color: var(--warn); }
+    .metric-card[data-tone="err"] .metric-value { color: var(--err); }
+
+    .workspace-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+
+    @media (max-width: 980px) {
+      .workspace-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 360px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .notice {
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      background: var(--surface-alt);
+      color: var(--muted);
+    }
+
+    .notice.warn {
+      background: var(--warn-bg);
+      border-color: rgba(245, 158, 11, 0.4);
+      color: var(--warn);
+    }
+
+    .notice.err {
+      background: var(--err-bg);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: var(--err);
+    }
+
+    .stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .gate-card {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .gate-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .gate-tool {
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .gate-time {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .gate-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    .gate-args {
+      margin: 0;
+      padding: 8px 10px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text);
+      overflow-x: auto;
+      max-height: 180px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .gate-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+
+    .stream-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 560px;
+      overflow-y: auto;
+    }
+
+    .event-row {
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 9px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 12px;
+    }
+
+    .event-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .event-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .badge[data-tone="ok"] {
+      color: var(--ok);
+      border-color: rgba(34, 197, 94, 0.45);
+      background: var(--ok-bg);
+    }
+
+    .badge[data-tone="warn"] {
+      color: var(--warn);
+      border-color: rgba(245, 158, 11, 0.45);
+      background: var(--warn-bg);
+    }
+
+    .badge[data-tone="err"] {
+      color: var(--err);
+      border-color: rgba(239, 68, 68, 0.45);
+      background: var(--err-bg);
+    }
+
+    .mono {
+      font-family: var(--mono);
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .empty {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 18px 0;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span>Keelway MCP Gateway</span>
+      <span id="conn-pill" class="status-pill" data-state="disconnected">
+        <span class="status-dot"></span>
+        <span id="conn-label">Disconnected</span>
+      </span>
+    </div>
+    <form id="auth-form" class="auth-controls" autocomplete="off">
+      <input id="token-input" type="password" placeholder="Bearer token (stored in sessionStorage)" aria-label="Bearer token">
+      <button id="connect-btn" type="submit" class="primary">Connect</button>
+      <button id="disconnect-btn" type="button" hidden>Disconnect</button>
+    </form>
+  </header>
+
+  <main>
+    <section aria-labelledby="metrics-heading">
+      <div class="section-header">
+        <h2 id="metrics-heading" class="section-title">Gateway Metrics</h2>
+        <span id="metrics-updated" class="section-meta">Polling /metrics every 2s</span>
+      </div>
+      <div id="metrics-grid" class="metrics-grid"></div>
+    </section>
+
+    <div class="workspace-grid">
+      <section class="panel" aria-labelledby="p10-heading">
+        <div class="section-header">
+          <h2 id="p10-heading" class="section-title">P-10 Approval Queue</h2>
+          <span id="p10-count" class="section-meta">0 pending</span>
+        </div>
+        <div id="p10-notice" class="notice" hidden></div>
+        <div id="p10-list" class="stack">
+          <div class="empty">Connect with a Bearer token to inspect pending P-10 approvals.</div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="stream-heading">
+        <div class="section-header">
+          <h2 id="stream-heading" class="section-title">Live Decision Stream</h2>
+          <div class="auth-controls">
+            <span id="stream-status" class="section-meta">Idle</span>
+            <button id="clear-stream-btn" type="button">Clear</button>
+          </div>
+        </div>
+        <div id="stream-notice" class="notice" hidden></div>
+        <div id="stream-list" class="stream-list">
+          <div class="empty">Connect with a Bearer token to subscribe to /events.</div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      'use strict';
+
+      var TOKEN_STORAGE_KEY = 'keelway_bearer_token';
+      var POLL_INTERVAL_MS = 2000;
+      var MAX_STREAM_EVENTS = 200;
+
+      var METRIC_DEFS = [
+        { key: 'calls:allowed', label: 'Allowed Calls', tone: 'ok' },
+        { key: 'p10_pending', label: 'P-10 Pending', tone: 'warn' },
+        { key: 'calls:p10_approved', label: 'P-10 Approved', tone: 'ok' },
+        { key: 'calls:p10_denied', label: 'P-10 Denied', tone: 'err' },
+        { key: 'calls:denied_policy', label: 'Denied (Policy)', tone: 'err' },
+        { key: 'calls:denied_auth', label: 'Denied (Auth)', tone: 'err' },
+        { key: 'calls:denied_budget', label: 'Denied (Budget)', tone: 'warn' },
+        { key: 'errors:timeout', label: 'Upstream Timeouts', tone: 'warn' },
+        { key: 'errors:error', label: 'Upstream Errors', tone: 'err' }
+      ];
+
+      var els = {
+        authForm: document.getElementById('auth-form'),
+        tokenInput: document.getElementById('token-input'),
+        connectBtn: document.getElementById('connect-btn'),
+        disconnectBtn: document.getElementById('disconnect-btn'),
+        connPill: document.getElementById('conn-pill'),
+        connLabel: document.getElementById('conn-label'),
+        metricsGrid: document.getElementById('metrics-grid'),
+        metricsUpdated: document.getElementById('metrics-updated'),
+        p10Count: document.getElementById('p10-count'),
+        p10Notice: document.getElementById('p10-notice'),
+        p10List: document.getElementById('p10-list'),
+        streamStatus: document.getElementById('stream-status'),
+        streamNotice: document.getElementById('stream-notice'),
+        streamList: document.getElementById('stream-list'),
+        clearStreamBtn: document.getElementById('clear-stream-btn')
+      };
+
+      var metricValueEls = {};
+      var activeToken = '';
+      var p10PollTimer = null;
+      var sseAbortController = null;
+      var sseReconnectTimer = null;
+      var inFlightApprovals = new Set();
+
+      function initMetricCards() {
+        for (var i = 0; i < METRIC_DEFS.length; i++) {
+          var def = METRIC_DEFS[i];
+          var card = document.createElement('div');
+          card.className = 'metric-card';
+          card.setAttribute('data-tone', def.tone);
+
+          var label = document.createElement('div');
+          label.className = 'metric-label';
+          label.textContent = def.label;
+
+          var val = document.createElement('div');
+          val.className = 'metric-value';
+          val.textContent = '-';
+
+          card.appendChild(label);
+          card.appendChild(val);
+          els.metricsGrid.appendChild(card);
+          metricValueEls[def.key] = val;
+        }
+      }
+
+      function setConnectionState(state, text) {
+        els.connPill.setAttribute('data-state', state);
+        els.connLabel.textContent = text;
+      }
+
+      function setNotice(el, message, tone) {
+        if (!message) {
+          el.hidden = true;
+          el.textContent = '';
+          el.className = 'notice';
+          return;
+        }
+        el.hidden = false;
+        el.textContent = message;
+        el.className = tone ? ('notice ' + tone) : 'notice';
+      }
+
+      function parsePrometheusMetrics(text) {
+        var parsed = {};
+        var lines = text.split(/\r?\n/);
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim();
+          if (!line || line.charAt(0) === '#') {
+            continue;
+          }
+          var mCalls = line.match(/^keelway_calls_total\{outcome="([^"]+)"\}\s+([0-9eE.+\-]+)$/);
+          if (mCalls) {
+            parsed['calls:' + mCalls[1]] = mCalls[2];
+            continue;
+          }
+          var mErrs = line.match(/^keelway_upstream_errors_total\{kind="([^"]+)"\}\s+([0-9eE.+\-]+)$/);
+          if (mErrs) {
+            parsed['errors:' + mErrs[1]] = mErrs[2];
+            continue;
+          }
+          var mPending = line.match(/^keelway_p10_pending\s+([0-9eE.+\-]+)$/);
+          if (mPending) {
+            parsed['p10_pending'] = mPending[1];
+          }
+        }
+        return parsed;
+      }
+
+      async function pollMetrics() {
+        try {
+          var res = await fetch('/metrics', { cache: 'no-store' });
+          if (!res.ok) {
+            els.metricsUpdated.textContent = 'Metrics error: HTTP ' + res.status;
+            return;
+          }
+          var text = await res.text();
+          var values = parsePrometheusMetrics(text);
+          for (var i = 0; i < METRIC_DEFS.length; i++) {
+            var key = METRIC_DEFS[i].key;
+            metricValueEls[key].textContent = Object.prototype.hasOwnProperty.call(values, key)
+              ? values[key]
+              : '0';
+          }
+          els.metricsUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
+        } catch (err) {
+          els.metricsUpdated.textContent = 'Metrics unreachable';
+        }
+      }
+
+      function clearChildren(node) {
+        while (node.firstChild) {
+          node.removeChild(node.firstChild);
+        }
+      }
+
+      function formatArgs(redactedArgs) {
+        if (typeof redactedArgs === 'string') {
+          return redactedArgs;
+        }
+        try {
+          return JSON.stringify(redactedArgs, null, 2);
+        } catch (e) {
+          return String(redactedArgs);
+        }
+      }
+
+      function renderPendingGates(items) {
+        clearChildren(els.p10List);
+        els.p10Count.textContent = items.length + ' pending';
+
+        if (items.length === 0) {
+          var empty = document.createElement('div');
+          empty.className = 'empty';
+          empty.textContent = 'No pending P-10 approvals.';
+          els.p10List.appendChild(empty);
+          return;
+        }
+
+        for (var i = 0; i < items.length; i++) {
+          (function (gate) {
+            var card = document.createElement('div');
+            card.className = 'gate-card';
+
+            var top = document.createElement('div');
+            top.className = 'gate-top';
+
+            var toolEl = document.createElement('span');
+            toolEl.className = 'gate-tool';
+            toolEl.textContent = String(gate.server || '') + '.' + String(gate.tool || '');
+
+            var timeEl = document.createElement('span');
+            timeEl.className = 'gate-time';
+            timeEl.textContent = String(gate.created_at || '');
+
+            top.appendChild(toolEl);
+            top.appendChild(timeEl);
+
+            var meta = document.createElement('div');
+            meta.className = 'gate-meta';
+
+            var idSpan = document.createElement('span');
+            idSpan.textContent = 'id: ' + String(gate.approval_id || '');
+            var orgSpan = document.createElement('span');
+            orgSpan.textContent = 'org: ' + String(gate.org_id || '');
+            var agentSpan = document.createElement('span');
+            agentSpan.textContent = 'agent: ' + String(gate.agent_id || '');
+
+            meta.appendChild(idSpan);
+            meta.appendChild(orgSpan);
+            meta.appendChild(agentSpan);
+
+            var argsPre = document.createElement('pre');
+            argsPre.className = 'gate-args';
+            argsPre.textContent = formatArgs(gate.redacted_args);
+
+            var actions = document.createElement('div');
+            actions.className = 'gate-actions';
+
+            var isBusy = inFlightApprovals.has(gate.approval_id);
+
+            var approveBtn = document.createElement('button');
+            approveBtn.type = 'button';
+            approveBtn.className = 'approve';
+            approveBtn.textContent = 'Approve';
+            approveBtn.disabled = isBusy;
+
+            var denyBtn = document.createElement('button');
+            denyBtn.type = 'button';
+            denyBtn.className = 'deny';
+            denyBtn.textContent = 'Deny';
+            denyBtn.disabled = isBusy;
+
+            approveBtn.addEventListener('click', function () {
+              resolveGate(gate.approval_id, true, approveBtn, denyBtn);
+            });
+            denyBtn.addEventListener('click', function () {
+              resolveGate(gate.approval_id, false, approveBtn, denyBtn);
+            });
+
+            actions.appendChild(denyBtn);
+            actions.appendChild(approveBtn);
+
+            card.appendChild(top);
+            card.appendChild(meta);
+            card.appendChild(argsPre);
+            card.appendChild(actions);
+
+            els.p10List.appendChild(card);
+          })(items[i]);
+        }
+      }
+
+      async function resolveGate(approvalId, approved, approveBtn, denyBtn) {
+        if (!activeToken || !approvalId) {
+          return;
+        }
+        inFlightApprovals.add(approvalId);
+        approveBtn.disabled = true;
+        denyBtn.disabled = true;
+
+        try {
+          var res = await fetch('/p10/resolve', {
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + activeToken,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              approval_id: approvalId,
+              approved: approved
+            })
+          });
+
+          if (res.status === 403) {
+            setNotice(els.p10Notice, 'Access denied (403 Forbidden): p10-approver or admin role is required to resolve approvals.', 'warn');
+          } else if (res.status === 401) {
+            setNotice(els.p10Notice, 'Authentication failed (401 Unauthorized). Please check your Bearer token.', 'err');
+          } else if (!res.ok) {
+            setNotice(els.p10Notice, 'Failed to resolve approval (' + approvalId + '): HTTP ' + res.status, 'err');
+          } else {
+            setNotice(els.p10Notice, null);
+          }
+        } catch (err) {
+          setNotice(els.p10Notice, 'Network error while resolving approval.', 'err');
+        } finally {
+          inFlightApprovals.delete(approvalId);
+          pollPending();
+          pollMetrics();
+        }
+      }
+
+      async function pollPending() {
+        if (!activeToken) {
+          return;
+        }
+        try {
+          var res = await fetch('/p10/pending', {
+            headers: { 'Authorization': 'Bearer ' + activeToken },
+            cache: 'no-store'
+          });
+          if (res.status === 401) {
+            setNotice(els.p10Notice, 'Authentication failed (401 Unauthorized). Check your Bearer token.', 'err');
+            setConnectionState('error', 'Unauthorized');
+            clearChildren(els.p10List);
+            els.p10Count.textContent = '0 pending';
+            return;
+          }
+          if (res.status === 403) {
+            setNotice(els.p10Notice, '403 Forbidden: p10-approver or admin role is required to view or resolve P-10 approvals.', 'warn');
+            clearChildren(els.p10List);
+            els.p10Count.textContent = 'restricted';
+            return;
+          }
+          if (!res.ok) {
+            setNotice(els.p10Notice, 'Error fetching /p10/pending: HTTP ' + res.status, 'err');
+            return;
+          }
+          setNotice(els.p10Notice, null);
+          var data = await res.json();
+          var list = Array.isArray(data && data.pending) ? data.pending : [];
+          renderPendingGates(list);
+        } catch (err) {
+          setNotice(els.p10Notice, 'Unable to reach /p10/pending.', 'err');
+        }
+      }
+
+      function outcomeTone(outcome) {
+        if (outcome === 'allowed' || outcome === 'p10_approved') {
+          return 'ok';
+        }
+        if (outcome === 'p10_awaiting' || outcome === 'denied_budget') {
+          return 'warn';
+        }
+        return 'err';
+      }
+
+      function appendStreamEvent(ev) {
+        if (els.streamList.firstChild && els.streamList.firstChild.classList && els.streamList.firstChild.classList.contains('empty')) {
+          clearChildren(els.streamList);
+        }
+
+        var row = document.createElement('div');
+        row.className = 'event-row';
+
+        var head = document.createElement('div');
+        head.className = 'event-head';
+
+        var left = document.createElement('div');
+        left.className = 'event-left';
+
+        var badge = document.createElement('span');
+        badge.className = 'badge';
+        badge.setAttribute('data-tone', outcomeTone(ev.outcome));
+        badge.textContent = String(ev.outcome || 'unknown');
+
+        var target = document.createElement('span');
+        target.className = 'mono';
+        target.textContent = String(ev.server || '') + '.' + String(ev.tool || '');
+
+        var actor = document.createElement('span');
+        actor.className = 'mono muted';
+        actor.textContent = String(ev.org_id || '') + '/' + String(ev.agent_id || '');
+
+        left.appendChild(badge);
+        left.appendChild(target);
+        left.appendChild(actor);
+
+        var ts = document.createElement('span');
+        ts.className = 'mono muted';
+        ts.textContent = String(ev.timestamp || '');
+
+        head.appendChild(left);
+        head.appendChild(ts);
+
+        var reason = document.createElement('div');
+        reason.className = 'muted';
+        var stateStr = ev.state ? ('[' + String(ev.state) + '] ') : '';
+        reason.textContent = stateStr + String(ev.reason || '');
+
+        row.appendChild(head);
+        row.appendChild(reason);
+
+        els.streamList.insertBefore(row, els.streamList.firstChild);
+        while (els.streamList.children.length > MAX_STREAM_EVENTS) {
+          els.streamList.removeChild(els.streamList.lastChild);
+        }
+      }
+
+      async function startEventStream() {
+        stopEventStream();
+        if (!activeToken) {
+          return;
+        }
+
+        var controller = new AbortController();
+        sseAbortController = controller;
+        els.streamStatus.textContent = 'Connecting...';
+        setNotice(els.streamNotice, null);
+
+        try {
+          var res = await fetch('/events', {
+            headers: { 'Authorization': 'Bearer ' + activeToken },
+            signal: controller.signal,
+            cache: 'no-store'
+          });
+
+          if (res.status === 401) {
+            setNotice(els.streamNotice, 'Authentication failed (401 Unauthorized) on /events.', 'err');
+            setConnectionState('error', 'Unauthorized');
+            els.streamStatus.textContent = 'Unauthorized';
+            return;
+          }
+          if (!res.ok || !res.body) {
+            setNotice(els.streamNotice, 'Failed to open /events stream: HTTP ' + res.status, 'err');
+            els.streamStatus.textContent = 'Error';
+            scheduleStreamReconnect();
+            return;
+          }
+
+          setConnectionState('connected', 'Connected');
+          els.streamStatus.textContent = 'Streaming';
+
+          var reader = res.body.getReader();
+          var decoder = new TextDecoder('utf-8');
+          var buffer = '';
+          var dataLines = [];
+
+          while (true) {
+            var chunk = await reader.read();
+            if (chunk.done) {
+              break;
+            }
+            buffer += decoder.decode(chunk.value, { stream: true });
+
+            var newlineIdx;
+            while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+              var rawLine = buffer.slice(0, newlineIdx);
+              buffer = buffer.slice(newlineIdx + 1);
+              var line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+
+              if (line === '') {
+                if (dataLines.length > 0) {
+                  var payloadText = dataLines.join('\n');
+                  dataLines = [];
+                  try {
+                    var parsed = JSON.parse(payloadText);
+                    appendStreamEvent(parsed);
+                  } catch (parseErr) {
+                    // Ignore malformed event frame
+                  }
+                }
+              } else if (line.charAt(0) === ':') {
+                // SSE comment / keep-alive
+              } else if (line.indexOf('data:') === 0) {
+                var val = line.slice(5);
+                if (val.charAt(0) === ' ') {
+                  val = val.slice(1);
+                }
+                dataLines.push(val);
+              }
+            }
+          }
+
+          if (!controller.signal.aborted && activeToken) {
+            els.streamStatus.textContent = 'Reconnecting...';
+            scheduleStreamReconnect();
+          }
+        } catch (err) {
+          if (controller.signal.aborted) {
+            return;
+          }
+          els.streamStatus.textContent = 'Disconnected';
+          setNotice(els.streamNotice, 'Stream disconnected. Reconnecting...', 'warn');
+          scheduleStreamReconnect();
+        }
+      }
+
+      function scheduleStreamReconnect() {
+        if (sseReconnectTimer) {
+          clearTimeout(sseReconnectTimer);
+        }
+        sseReconnectTimer = setTimeout(function () {
+          sseReconnectTimer = null;
+          if (activeToken) {
+            startEventStream();
+          }
+        }, 2000);
+      }
+
+      function stopEventStream() {
+        if (sseReconnectTimer) {
+          clearTimeout(sseReconnectTimer);
+          sseReconnectTimer = null;
+        }
+        if (sseAbortController) {
+          sseAbortController.abort();
+          sseAbortController = null;
+        }
+      }
+
+      function connectWithToken(token) {
+        var trimmed = token.trim();
+        if (!trimmed) {
+          return;
+        }
+        activeToken = trimmed;
+        sessionStorage.setItem(TOKEN_STORAGE_KEY, activeToken);
+        els.tokenInput.value = activeToken;
+        els.disconnectBtn.hidden = false;
+        els.connectBtn.textContent = 'Reconnect';
+        setConnectionState('connected', 'Connecting...');
+
+        if (p10PollTimer) {
+          clearInterval(p10PollTimer);
+        }
+        pollPending();
+        p10PollTimer = setInterval(pollPending, POLL_INTERVAL_MS);
+        startEventStream();
+      }
+
+      function disconnect() {
+        activeToken = '';
+        sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+        els.tokenInput.value = '';
+        els.disconnectBtn.hidden = true;
+        els.connectBtn.textContent = 'Connect';
+        setConnectionState('disconnected', 'Disconnected');
+        els.streamStatus.textContent = 'Idle';
+
+        if (p10PollTimer) {
+          clearInterval(p10PollTimer);
+          p10PollTimer = null;
+        }
+        stopEventStream();
+
+        setNotice(els.p10Notice, null);
+        setNotice(els.streamNotice, null);
+        els.p10Count.textContent = '0 pending';
+        clearChildren(els.p10List);
+        var p10Empty = document.createElement('div');
+        p10Empty.className = 'empty';
+        p10Empty.textContent = 'Connect with a Bearer token to inspect pending P-10 approvals.';
+        els.p10List.appendChild(p10Empty);
+      }
+
+      els.authForm.addEventListener('submit', function (e) {
+        e.preventDefault();
+        connectWithToken(els.tokenInput.value);
+      });
+
+      els.disconnectBtn.addEventListener('click', function () {
+        disconnect();
+      });
+
+      els.clearStreamBtn.addEventListener('click', function () {
+        clearChildren(els.streamList);
+        var empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = activeToken
+          ? 'Waiting for live events...'
+          : 'Connect with a Bearer token to subscribe to /events.';
+        els.streamList.appendChild(empty);
+      });
+
+      initMetricCards();
+      pollMetrics();
+      setInterval(pollMetrics, POLL_INTERVAL_MS);
+
+      var savedToken = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+      if (savedToken) {
+        connectWithToken(savedToken);
+      }
+    })();
+  </script>
+</body>
+</html>
