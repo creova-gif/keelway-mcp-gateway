@@ -15,6 +15,7 @@ use crate::upstream::UpstreamDriver;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
 use std::sync::Arc;
@@ -88,7 +89,7 @@ pub struct GatewayRuntime {
     pub(crate) circuit_breaker: CircuitBreaker,
     pub(crate) metrics: Arc<GatewayMetrics>,
     pub(crate) shutdown_tx: tokio::sync::watch::Sender<bool>,
-    token_map: HashMap<String, Principal>,
+    token_digests: HashMap<[u8; 32], Principal>,
     jwt_verifier: Option<JwtVerifier>,
     upstreams: HashMap<String, UpstreamDriver>,
     resources: Vec<(String, ResourceConfig)>,
@@ -107,7 +108,7 @@ impl GatewayRuntime {
         console_to_stderr: bool,
     ) -> Result<Self, KeelwayError> {
         let mut collected_secrets = Vec::new();
-        let mut token_map = HashMap::new();
+        let mut token_digests = HashMap::new();
 
         for p in &config.principals {
             if let Some(ref tref) = p.token_ref {
@@ -115,7 +116,8 @@ impl GatewayRuntime {
                 if tref.starts_with("secret://") {
                     collected_secrets.push(tok.clone());
                 }
-                token_map.insert(tok, p.to_principal());
+                let digest: [u8; 32] = Sha256::digest(tok.as_bytes()).into();
+                token_digests.insert(digest, p.to_principal());
             }
         }
 
@@ -186,7 +188,7 @@ impl GatewayRuntime {
             circuit_breaker,
             metrics,
             shutdown_tx,
-            token_map,
+            token_digests,
             jwt_verifier,
             upstreams,
             resources,
@@ -208,7 +210,8 @@ impl GatewayRuntime {
         if token.is_empty() {
             return None;
         }
-        self.token_map.get(token).cloned()
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        self.token_digests.get(&digest).cloned()
     }
 
     /// Authenticates static bearer tokens first, then falls back to stateless JWT/OIDC verification.
@@ -1531,4 +1534,51 @@ pub async fn serve_stdio_loop(
         stdout.flush().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::PrincipalConfig;
+    use crate::secrets::DefaultSecretProvider;
+
+    #[test]
+    fn bearer_token_digest_lookup_matches_valid_and_rejects_invalid() -> Result<(), KeelwayError> {
+        let mut config = GatewayConfig::default();
+        config.principals.push(PrincipalConfig {
+            org_id: "acme".to_string(),
+            agent_id: "agent-1".to_string(),
+            roles: vec!["reader".to_string()],
+            token_ref: Some("tok-secret-123".to_string()),
+        });
+
+        let policy = Arc::new(PolicyEngine::from_config_and_cedar(&config, "")?);
+        let dir = tempfile::tempdir()?;
+        let tape = TapeWriter::open(dir.path().join("tape.jsonl"))?;
+        let runtime = GatewayRuntime::build(&config, policy, tape, &DefaultSecretProvider, false)?;
+
+        let Some(matched) = runtime.authenticate_bearer(Some("Bearer tok-secret-123")) else {
+            return Err(KeelwayError::Auth(
+                "valid token should authenticate".to_owned(),
+            ));
+        };
+        assert_eq!(matched.org_id, "acme");
+        assert_eq!(matched.agent_id, "agent-1");
+        assert_eq!(matched.roles, vec!["reader"]);
+
+        assert!(runtime.authenticate_bearer(Some("Bearer   ")).is_none());
+        assert!(runtime.authenticate_bearer(Some("Bearer")).is_none());
+        assert!(
+            runtime
+                .authenticate_bearer(Some("Bearer wrong-token"))
+                .is_none()
+        );
+        assert!(
+            runtime
+                .authenticate_bearer(Some("Basic tok-secret-123"))
+                .is_none()
+        );
+        assert!(runtime.authenticate_bearer(None).is_none());
+        Ok(())
+    }
 }
