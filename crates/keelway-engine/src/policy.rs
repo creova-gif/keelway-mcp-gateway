@@ -8,6 +8,7 @@ use cedar_policy::{
     EntityUid, PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 use globset::{Glob, GlobMatcher};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -443,7 +444,19 @@ action "get_prompt" appliesTo {{
     Ok(schema)
 }
 
-/// Pre-builds static Cedar `Entities` (Agents, Roles, Tools) cached inside `PolicySnapshot`.
+/// Collision-free Cedar `Agent` entity ID encoding `org_id` and `agent_id`.
+/// Percent-encoding both components prevents `("a/b", "c")` and `("a", "b/c")` from colliding.
+fn encoded_agent_uid(principal: &Principal) -> String {
+    format!(
+        "{}/{}",
+        utf8_percent_encode(&principal.org_id, NON_ALPHANUMERIC),
+        utf8_percent_encode(&principal.agent_id, NON_ALPHANUMERIC),
+    )
+}
+
+/// Pre-builds static Cedar `Entities` (Roles, Tools) cached inside `PolicySnapshot`.
+/// `Agent` entities are intentionally NOT pre-populated here so stateless JWT callers
+/// can never inherit roles from static `config.principals` entries.
 fn build_static_entities(
     config: &GatewayConfig,
     schema: &Schema,
@@ -459,8 +472,6 @@ fn build_static_entities(
 
     let role_type = EntityTypeName::from_str("Role")
         .map_err(|e| KeelwayError::Policy(format!("entity type Role error: {e}")))?;
-    let agent_type = EntityTypeName::from_str("Agent")
-        .map_err(|e| KeelwayError::Policy(format!("entity type Agent error: {e}")))?;
     let tool_type = EntityTypeName::from_str("Tool")
         .map_err(|e| KeelwayError::Policy(format!("entity type Tool error: {e}")))?;
 
@@ -468,28 +479,6 @@ fn build_static_entities(
         let uid = EntityUid::from_type_name_and_id(role_type.clone(), EntityId::new(role));
         let ent = Entity::new(uid, HashMap::new(), HashSet::new())
             .map_err(|e| KeelwayError::Policy(format!("role entity error: {e}")))?;
-        entities.push(ent);
-    }
-
-    for p in &config.principals {
-        let canonical = format!("{}/{}", p.org_id, p.agent_id);
-        let uid = EntityUid::from_type_name_and_id(agent_type.clone(), EntityId::new(canonical));
-        let mut attrs = HashMap::new();
-        attrs.insert(
-            "org_id".to_owned(),
-            RestrictedExpression::new_string(p.org_id.clone()),
-        );
-        attrs.insert(
-            "agent_id".to_owned(),
-            RestrictedExpression::new_string(p.agent_id.clone()),
-        );
-        let parents: HashSet<EntityUid> = p
-            .roles
-            .iter()
-            .map(|r| EntityUid::from_type_name_and_id(role_type.clone(), EntityId::new(r.clone())))
-            .collect();
-        let ent = Entity::new(uid, attrs, parents)
-            .map_err(|e| KeelwayError::Policy(format!("agent entity error: {e}")))?;
         entities.push(ent);
     }
 
@@ -539,8 +528,8 @@ fn build_static_entities(
         .map_err(|e| KeelwayError::Policy(format!("failed to build cedar entities: {e}")))
 }
 
-/// Ensures `Agent` (with `Role` parents for stateless JWT principals) and `Tool` entities
-/// exist for the current request, borrowing `base` when all entities are already present.
+/// Always builds the caller's `Agent` entity directly from `principal` (with any missing `Role`
+/// entities) and ensures the target `Tool` entity exists for the current request.
 fn entities_for_request<'a>(
     base: &'a Entities,
     schema: &Schema,
@@ -555,39 +544,35 @@ fn entities_for_request<'a>(
     let tool_type = EntityTypeName::from_str("Tool")
         .map_err(|e| KeelwayError::Policy(format!("entity type Tool error: {e}")))?;
 
-    let agent_uid = EntityUid::from_type_name_and_id(
-        agent_type,
-        EntityId::new(format!("{}/{}", principal.org_id, principal.agent_id)),
-    );
+    let agent_uid =
+        EntityUid::from_type_name_and_id(agent_type, EntityId::new(encoded_agent_uid(principal)));
     let tool_uid =
         EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
 
     let mut additions = Vec::new();
-    if base.get(&agent_uid).is_none() {
-        let mut parents = HashSet::new();
-        for role in &principal.roles {
-            let role_uid =
-                EntityUid::from_type_name_and_id(role_type.clone(), EntityId::new(role.clone()));
-            if base.get(&role_uid).is_none() {
-                let role_ent = Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())
-                    .map_err(|e| KeelwayError::Policy(format!("dynamic role entity error: {e}")))?;
-                additions.push(role_ent);
-            }
-            parents.insert(role_uid);
+    let mut parents = HashSet::new();
+    for role in &principal.roles {
+        let role_uid =
+            EntityUid::from_type_name_and_id(role_type.clone(), EntityId::new(role.clone()));
+        if base.get(&role_uid).is_none() {
+            let role_ent = Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())
+                .map_err(|e| KeelwayError::Policy(format!("dynamic role entity error: {e}")))?;
+            additions.push(role_ent);
         }
-        let mut attrs = HashMap::new();
-        attrs.insert(
-            "org_id".to_owned(),
-            RestrictedExpression::new_string(principal.org_id.clone()),
-        );
-        attrs.insert(
-            "agent_id".to_owned(),
-            RestrictedExpression::new_string(principal.agent_id.clone()),
-        );
-        let agent_ent = Entity::new(agent_uid, attrs, parents)
-            .map_err(|e| KeelwayError::Policy(format!("dynamic agent entity error: {e}")))?;
-        additions.push(agent_ent);
+        parents.insert(role_uid);
     }
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "org_id".to_owned(),
+        RestrictedExpression::new_string(principal.org_id.clone()),
+    );
+    attrs.insert(
+        "agent_id".to_owned(),
+        RestrictedExpression::new_string(principal.agent_id.clone()),
+    );
+    let agent_ent = Entity::new(agent_uid, attrs, parents)
+        .map_err(|e| KeelwayError::Policy(format!("dynamic agent entity error: {e}")))?;
+    additions.push(agent_ent);
 
     if base.get(&tool_uid).is_none() {
         let mut attrs = HashMap::new();
@@ -633,7 +618,7 @@ fn build_cedar_request(
 
     // Infallible EntityUid construction (no format!().parse().unwrap())
     let principal_uid =
-        EntityUid::from_type_name_and_id(agent_type, EntityId::new(principal.canonical_id()));
+        EntityUid::from_type_name_and_id(agent_type, EntityId::new(encoded_agent_uid(principal)));
     let action_uid = EntityUid::from_type_name_and_id(action_type, EntityId::new(action_name));
     let resource_uid =
         EntityUid::from_type_name_and_id(tool_type, EntityId::new(format!("{server}/{tool}")));
@@ -1122,6 +1107,51 @@ forbid(
             },
         )?;
         assert_eq!(allowed.decision, Decision::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn jwt_caller_does_not_inherit_static_principal_roles_and_slash_ids_do_not_collide()
+    -> Result<(), KeelwayError> {
+        let cfg = sample_config();
+        let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"github/list_repos"
+);
+"#;
+        let engine = PolicyEngine::from_config_and_cedar(&cfg, cedar)?;
+
+        // Static principal has ("acme", "dev-1") with role "developer".
+        // A JWT caller with the same org_id/agent_id but empty roles must NOT inherit "developer".
+        let jwt_unprivileged = Principal {
+            org_id: "acme".to_owned(),
+            agent_id: "dev-1".to_owned(),
+            roles: vec![],
+        };
+        let eval = engine.evaluate(
+            &jwt_unprivileged,
+            &ToolCall {
+                server: "github".to_owned(),
+                tool: "list_repos".to_owned(),
+                arguments: json!({}),
+            },
+        )?;
+        assert_eq!(eval.decision, Decision::Deny);
+
+        // Separator collision check: ("a/b", "c") vs ("a", "b/c") must encode distinctly.
+        let p1 = Principal {
+            org_id: "a/b".to_owned(),
+            agent_id: "c".to_owned(),
+            roles: vec![],
+        };
+        let p2 = Principal {
+            org_id: "a".to_owned(),
+            agent_id: "b/c".to_owned(),
+            roles: vec![],
+        };
+        assert_ne!(encoded_agent_uid(&p1), encoded_agent_uid(&p2));
         Ok(())
     }
 }

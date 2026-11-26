@@ -1558,6 +1558,12 @@ async fn mcp_lifecycle_and_resource_prompt_governance_work_end_to_end() -> Resul
                     mime_type: Some("text/markdown".to_owned()),
                 },
                 ResourceConfig {
+                    uri: "file:///shared/guide.md".to_owned(),
+                    name: Some("Shared Guide".to_owned()),
+                    description: Some("Permitted file URI document".to_owned()),
+                    mime_type: Some("text/markdown".to_owned()),
+                },
+                ResourceConfig {
                     uri: "docs://forbidden.md".to_owned(),
                     name: Some("Forbidden Doc".to_owned()),
                     description: None,
@@ -1584,6 +1590,11 @@ permit (
     principal in Role::"developer",
     action == Action::"read_resource",
     resource == Tool::"docs/docs://allowed.md"
+);
+permit (
+    principal in Role::"developer",
+    action == Action::"read_resource",
+    resource == Tool::"docs/file:///shared/guide.md"
 );
 permit (
     principal in Role::"developer",
@@ -1668,12 +1679,20 @@ permit (
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
     assert_eq!(
         res_list["result"]["resources"],
-        json!([{
-            "uri": "docs://allowed.md",
-            "name": "Allowed Doc",
-            "description": "Permitted markdown document",
-            "mimeType": "text/markdown"
-        }])
+        json!([
+            {
+                "uri": "docs://allowed.md",
+                "name": "Allowed Doc",
+                "description": "Permitted markdown document",
+                "mimeType": "text/markdown"
+            },
+            {
+                "uri": "file:///shared/guide.md",
+                "name": "Shared Guide",
+                "description": "Permitted file URI document",
+                "mimeType": "text/markdown"
+            }
+        ])
     );
 
     let prompt_list: Value = client
@@ -1737,7 +1756,37 @@ permit (
     assert!(!read_text.contains("sk-super-secret-resource"));
     assert!(read_text.contains("[REDACTED]"));
 
-    // 6. Permitted prompts/get scrubs secrets
+    // 5b. Discovered non-<server>:// resource URI routes unambiguously without params.server
+    let discovered_uri = res_list["result"]["resources"][1]["uri"]
+        .as_str()
+        .ok_or_else(|| KeelwayError::Mcp("missing discovered resource uri".to_owned()))?;
+    let discovered_read: Value = client
+        .post(&url)
+        .header("authorization", "Bearer tok-lifecycle")
+        .header("traceparent", format!("00-{trace_id}-00f067aa0ba902b7-01"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 70,
+            "method": "resources/read",
+            "params": { "uri": discovered_uri }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    let discovered_read_text = discovered_read["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(discovered_read_text.contains("doc-ok"));
+    assert!(!discovered_read_text.contains("sk-super-secret-resource"));
+    assert!(discovered_read_text.contains("[REDACTED]"));
+
+    // 6. Permitted prompts/get (discovered prompt name without params.server) scrubs secrets
+    let discovered_prompt_name = prompt_list["result"]["prompts"][0]["name"]
+        .as_str()
+        .ok_or_else(|| KeelwayError::Mcp("missing discovered prompt name".to_owned()))?;
     let allowed_prompt: Value = client
         .post(&url)
         .header("authorization", "Bearer tok-lifecycle")
@@ -1746,7 +1795,7 @@ permit (
             "jsonrpc": "2.0",
             "id": 8,
             "method": "prompts/get",
-            "params": { "server": "docs", "name": "summarize" }
+            "params": { "name": discovered_prompt_name }
         }))
         .send()
         .await
@@ -1763,7 +1812,7 @@ permit (
 
     // 7. Verify audit tape receipts & trace_id provenance
     let verified = GatewayEngine::verify_tape_with_key(&tape_path, None)?;
-    assert_eq!(verified.count, 3);
+    assert_eq!(verified.count, 4);
     let mut receipts = Vec::new();
     GatewayEngine::inspect_tape(&tape_path, |r| {
         receipts.push((
@@ -1798,6 +1847,14 @@ permit (
             (
                 "docs".to_owned(),
                 "docs://allowed.md".to_owned(),
+                Decision::Allow,
+                ReceiptState::Sealed,
+                Some(trace_id.to_owned()),
+                Some("read_resource".to_owned())
+            ),
+            (
+                "docs".to_owned(),
+                "file:///shared/guide.md".to_owned(),
                 Decision::Allow,
                 ReceiptState::Sealed,
                 Some(trace_id.to_owned()),

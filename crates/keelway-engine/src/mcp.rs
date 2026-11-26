@@ -514,15 +514,26 @@ impl GatewayRuntime {
 
     /// Authenticates static bearer tokens first, then falls back to stateless JWT/OIDC verification.
     pub async fn authenticate_bearer_async(&self, auth_header: Option<&str>) -> Option<Principal> {
+        self.authenticate_bearer_with_exp(auth_header)
+            .await
+            .map(|(p, _)| p)
+    }
+
+    /// Authenticates static bearer tokens first (no expiry), then falls back to stateless JWT/OIDC
+    /// verification returning both `Principal` and optional `exp` (Unix seconds).
+    pub async fn authenticate_bearer_with_exp(
+        &self,
+        auth_header: Option<&str>,
+    ) -> Option<(Principal, Option<u64>)> {
         if let Some(principal) = self.authenticate_bearer(auth_header) {
-            return Some(principal);
+            return Some((principal, None));
         }
         let verifier = self.jwt_verifier.as_ref()?;
         let token = auth_header?.strip_prefix("Bearer ")?.trim();
         if token.is_empty() {
             return None;
         }
-        verifier.verify_token(token).await.ok()
+        verifier.verify_token_with_exp(token).await.ok()
     }
 
     /// Processes a single MCP JSON-RPC 2.0 request for an authenticated `principal`.
@@ -538,7 +549,10 @@ impl GatewayRuntime {
         req: Value,
         trace_id: Option<&str>,
     ) -> Value {
-        let base_provenance = trace_id.map(|tid| json!({ "trace_id": tid }));
+        let base_provenance = Some(match trace_id {
+            Some(tid) => json!({ "trace_id": tid, "roles": principal.roles }),
+            None => json!({ "roles": principal.roles }),
+        });
         let is_notification = req.get("id").is_none();
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
@@ -1193,11 +1207,30 @@ impl GatewayRuntime {
                 let Some(uri) = uri else {
                     return jsonrpc_error(id, -32602, "missing required params.uri", None);
                 };
-                let server = params
+                let explicit_server = params
                     .get("server")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty());
+                let server = explicit_server
+                    .or_else(|| {
+                        uri.split_once("://")
+                            .map(|(s, _)| s)
+                            .filter(|s| !s.is_empty() && self.upstreams.contains_key(*s))
+                    })
+                    .or_else(|| {
+                        let matches: Vec<&str> = self
+                            .resources
+                            .iter()
+                            .filter(|(_, r)| r.uri == uri)
+                            .map(|(s, _)| s.as_str())
+                            .collect();
+                        if matches.len() == 1 {
+                            Some(matches[0])
+                        } else {
+                            None
+                        }
+                    })
                     .or_else(|| {
                         uri.split_once("://")
                             .map(|(s, _)| s)
@@ -1207,7 +1240,7 @@ impl GatewayRuntime {
                     return jsonrpc_error(
                         id,
                         -32602,
-                        "missing params.server and uri is not '<server>://<path>'",
+                        "missing params.server and uri could not be unambiguously routed",
                         None,
                     );
                 };
@@ -1226,21 +1259,37 @@ impl GatewayRuntime {
             }
             "prompts/get" => {
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-                let server = params
-                    .get("server")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
                 let name = params
                     .get("name")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
-                let (Some(server), Some(name)) = (server, name) else {
+                let Some(name) = name else {
+                    return jsonrpc_error(id, -32602, "missing required params.name", None);
+                };
+                let server = params
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        let matches: Vec<&str> = self
+                            .prompts
+                            .iter()
+                            .filter(|(_, p)| p.name == name)
+                            .map(|(s, _)| s.as_str())
+                            .collect();
+                        if matches.len() == 1 {
+                            Some(matches[0])
+                        } else {
+                            None
+                        }
+                    });
+                let Some(server) = server else {
                     return jsonrpc_error(
                         id,
                         -32602,
-                        "missing required params.server or params.name",
+                        "missing required params.server (or ambiguous prompt name)",
                         None,
                     );
                 };
@@ -1281,8 +1330,10 @@ impl GatewayRuntime {
     ) -> Value {
         let scrubbed_target = self.scrubber.scrub_str(target_name);
         let receipt_provenance = Some(match trace_id {
-            Some(tid) => json!({ "trace_id": tid, "mcp_action": cedar_action }),
-            None => json!({ "mcp_action": cedar_action }),
+            Some(tid) => {
+                json!({ "trace_id": tid, "mcp_action": cedar_action, "roles": principal.roles })
+            }
+            None => json!({ "mcp_action": cedar_action, "roles": principal.roles }),
         });
         let req_bytes = serde_json::to_vec(params)
             .map(|v| v.len())
@@ -1753,35 +1804,74 @@ async fn events_sse_handler(
     headers: HeaderMap,
 ) -> Response {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let Some(principal) = runtime.authenticate_bearer_async(auth_header).await else {
+    let Some((principal, exp)) = runtime.authenticate_bearer_with_exp(auth_header).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthenticated" })),
         )
             .into_response();
     };
+    if let Some(exp_ts) = exp
+        && Utc::now().timestamp().max(0) as u64 >= exp_ts
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "token expired" })),
+        )
+            .into_response();
+    }
     let org_id = principal.org_id.clone();
     let rx_owned = runtime.metrics.subscribe();
-    let sse_stream =
-        futures_util::stream::unfold((rx_owned, org_id), |(mut rx, org_id)| async move {
+    let sse_stream = futures_util::stream::unfold(
+        (rx_owned, org_id, exp),
+        |(mut rx, org_id, exp)| async move {
             loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        if ev.org_id != org_id {
-                            continue;
-                        }
-                        let payload =
-                            serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
-                        return Some((
-                            Ok::<Event, std::convert::Infallible>(Event::default().data(payload)),
-                            (rx, org_id),
-                        ));
+                if let Some(exp_ts) = exp {
+                    let now = Utc::now().timestamp().max(0) as u64;
+                    if now >= exp_ts {
+                        return None;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    let remaining = std::time::Duration::from_secs(exp_ts - now);
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(Ok(ev)) => {
+                            if ev.org_id != org_id {
+                                continue;
+                            }
+                            let payload =
+                                serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                            return Some((
+                                Ok::<Event, std::convert::Infallible>(
+                                    Event::default().data(payload),
+                                ),
+                                (rx, org_id, exp),
+                            ));
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                        Err(_) => return None,
+                    }
+                } else {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            if ev.org_id != org_id {
+                                continue;
+                            }
+                            let payload =
+                                serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_owned());
+                            return Some((
+                                Ok::<Event, std::convert::Infallible>(
+                                    Event::default().data(payload),
+                                ),
+                                (rx, org_id, exp),
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
                 }
             }
-        });
+        },
+    );
     Sse::new(sse_stream)
         .keep_alive(KeepAlive::default())
         .into_response()

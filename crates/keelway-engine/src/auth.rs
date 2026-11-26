@@ -1,6 +1,6 @@
 use crate::core::{KeelwayError, Principal};
 use base64::Engine as _;
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 const JWKS_TIMEOUT_SECS: u64 = 5;
 const JWKS_CACHE_MAX_ENTRIES: usize = 64;
 const JWKS_CACHE_TTL_SECS: u64 = 300;
+const JWKS_REFRESH_COOLDOWN_SECS: u64 = 10;
+const MIN_HS256_SECRET_BYTES: usize = 32;
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 fn default_org_claim() -> String {
     "org_id".to_owned()
@@ -55,6 +60,7 @@ pub struct JwtVerifier {
     eddsa_key: Option<DecodingKey>,
     http_client: reqwest::Client,
     jwks_cache: RwLock<HashMap<String, CachedJwk>>,
+    last_jwks_fetch: RwLock<Option<Instant>>,
 }
 
 impl JwtVerifier {
@@ -80,12 +86,17 @@ impl JwtVerifier {
         }
 
         let hs256_key = match config.hs256_secret.as_deref() {
-            Some(secret) if !secret.is_empty() => Some(DecodingKey::from_secret(secret.as_bytes())),
-            Some(_) => {
+            Some("") => {
                 return Err(KeelwayError::Config(
                     "jwt hs256_secret must not be empty".to_owned(),
                 ));
             }
+            Some(secret) if secret.len() < MIN_HS256_SECRET_BYTES => {
+                return Err(KeelwayError::Config(format!(
+                    "jwt hs256_secret must be at least {MIN_HS256_SECRET_BYTES} bytes"
+                )));
+            }
+            Some(secret) => Some(DecodingKey::from_secret(secret.as_bytes())),
             None => None,
         };
 
@@ -99,12 +110,19 @@ impl JwtVerifier {
             None => None,
         };
 
-        if let Some(url) = config.jwks_url.as_deref()
-            && url.trim().is_empty()
-        {
-            return Err(KeelwayError::Config(
-                "jwt jwks_url must not be empty".to_owned(),
-            ));
+        if let Some(url) = config.jwks_url.as_deref() {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                return Err(KeelwayError::Config(
+                    "jwt jwks_url must not be empty".to_owned(),
+                ));
+            }
+            if !is_allowed_jwks_url(trimmed) {
+                return Err(KeelwayError::Config(
+                    "jwt jwks_url must use https:// (except local loopback http://localhost, http://127.0.0.1, or http://[::1])"
+                        .to_owned(),
+                ));
+            }
         }
 
         if hs256_key.is_none() && eddsa_key.is_none() && config.jwks_url.is_none() {
@@ -125,11 +143,21 @@ impl JwtVerifier {
             eddsa_key,
             http_client,
             jwks_cache: RwLock::new(HashMap::new()),
+            last_jwks_fetch: RwLock::new(None),
         })
     }
 
     /// Verifies a bearer JWT and maps its claims to an authenticated `Principal`.
     pub async fn verify_token(&self, token: &str) -> Result<Principal, KeelwayError> {
+        let (principal, _) = self.verify_token_with_exp(token).await?;
+        Ok(principal)
+    }
+
+    /// Verifies a bearer JWT, returning the authenticated `Principal` and optional `exp` timestamp.
+    pub async fn verify_token_with_exp(
+        &self,
+        token: &str,
+    ) -> Result<(Principal, Option<u64>), KeelwayError> {
         let token = token.trim();
         if token.is_empty() {
             return Err(KeelwayError::Auth("empty bearer token".to_owned()));
@@ -147,12 +175,15 @@ impl JwtVerifier {
         validation.set_audience(&[&self.config.audience]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.validate_exp = true;
+        validation.validate_nbf = true;
         validation.leeway = 0;
 
         let token_data = decode::<Map<String, Value>>(token, &decoding_key, &validation)
             .map_err(|e| KeelwayError::Auth(format!("JWT verification failed: {e}")))?;
 
-        self.claims_to_principal(&token_data.claims)
+        let exp = token_data.claims.get("exp").and_then(Value::as_u64);
+        let principal = self.claims_to_principal(&token_data.claims)?;
+        Ok((principal, exp))
     }
 
     async fn resolve_decoding_key(
@@ -206,11 +237,24 @@ impl JwtVerifier {
             return Ok(key);
         }
 
+        if let Ok(guard) = self.last_jwks_fetch.read()
+            && let Some(last_fetch) = *guard
+            && last_fetch.elapsed() < Duration::from_secs(JWKS_REFRESH_COOLDOWN_SECS)
+        {
+            return Err(KeelwayError::Auth(
+                "JWKS key not found (refresh cooldown active)".to_owned(),
+            ));
+        }
+
         let jwks_url = self
             .config
             .jwks_url
             .as_deref()
             .ok_or_else(|| KeelwayError::Auth("JWKS URL not configured".to_owned()))?;
+
+        if let Ok(mut guard) = self.last_jwks_fetch.write() {
+            *guard = Some(Instant::now());
+        }
 
         let response = self
             .http_client
@@ -226,12 +270,24 @@ impl JwtVerifier {
             )));
         }
 
-        let jwk_set: JwkSet = response
+        let payload: Value = response
             .json()
             .await
             .map_err(|e| KeelwayError::Auth(format!("invalid JWKS payload: {e}")))?;
 
-        self.cache_jwk_set(&jwk_set)?;
+        let keys = payload
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                KeelwayError::Auth("invalid JWKS payload: missing 'keys' array".to_owned())
+            })?;
+
+        let jwks: Vec<Jwk> = keys
+            .iter()
+            .filter_map(|entry| serde_json::from_value::<Jwk>(entry.clone()).ok())
+            .collect();
+
+        self.cache_jwks(&jwks)?;
 
         self.get_cached_jwk(kid)
             .ok_or_else(|| KeelwayError::Auth(format!("no matching JWK found for kid '{kid}'")))
@@ -247,7 +303,7 @@ impl JwtVerifier {
         }
     }
 
-    fn cache_jwk_set(&self, jwk_set: &JwkSet) -> Result<(), KeelwayError> {
+    fn cache_jwks(&self, jwks: &[Jwk]) -> Result<(), KeelwayError> {
         let mut guard = self
             .jwks_cache
             .write()
@@ -257,7 +313,7 @@ impl JwtVerifier {
         let ttl = Duration::from_secs(JWKS_CACHE_TTL_SECS);
         guard.retain(|_, v| now.duration_since(v.inserted_at) < ttl);
 
-        for jwk in &jwk_set.keys {
+        for jwk in jwks {
             let Some(kid) = jwk.common.key_id.as_deref() else {
                 continue;
             };
@@ -296,6 +352,20 @@ impl JwtVerifier {
     }
 }
 
+fn is_allowed_jwks_url(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    for prefix in ["http://localhost", "http://127.0.0.1", "http://[::1]"] {
+        if let Some(rest) = url.strip_prefix(prefix)
+            && (rest.is_empty() || rest.starts_with(':') || rest.starts_with('/'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn parse_ed25519_key(raw: &str) -> Result<DecodingKey, KeelwayError> {
     if raw.starts_with("-----BEGIN ") {
         return DecodingKey::from_ed_pem(raw.as_bytes())
@@ -305,13 +375,20 @@ fn parse_ed25519_key(raw: &str) -> Result<DecodingKey, KeelwayError> {
     let bytes = hex::decode(raw)
         .map_err(|e| KeelwayError::Config(format!("invalid Ed25519 public key hex: {e}")))?;
 
-    if bytes.len() == 32 {
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
-        DecodingKey::from_ed_components(&b64)
-            .map_err(|e| KeelwayError::Config(format!("invalid raw Ed25519 public key: {e}")))
+    let raw_key_bytes = if bytes.len() == 32 {
+        bytes.as_slice()
+    } else if bytes.len() == 44 && bytes.starts_with(&ED25519_SPKI_PREFIX) {
+        &bytes[12..]
     } else {
-        Ok(DecodingKey::from_ed_der(&bytes))
-    }
+        return Err(KeelwayError::Config(format!(
+            "invalid Ed25519 public key length: expected 32-byte raw key or 44-byte SPKI DER, got {} bytes",
+            bytes.len()
+        )));
+    };
+
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw_key_bytes);
+    DecodingKey::from_ed_components(&b64)
+        .map_err(|e| KeelwayError::Config(format!("invalid Ed25519 public key: {e}")))
 }
 
 fn extract_non_empty_claim(
@@ -528,6 +605,108 @@ mod tests {
 
         let err = verifier.verify_token(&token).await;
         assert!(matches!(err, Err(KeelwayError::Auth(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nbf_in_future_fails_closed() -> Result<(), KeelwayError> {
+        let cfg = test_config();
+        let secret = cfg.hs256_secret.clone().unwrap_or_default();
+        let verifier = JwtVerifier::new(cfg)?;
+
+        let now = Utc::now().timestamp();
+        let token = sign_hs256(
+            json!({
+                "iss": "https://idp.keelway.test",
+                "aud": "keelway-gateway",
+                "nbf": (now + 300) as u64,
+                "exp": (now + 600) as u64,
+                "org_id": "acme-corp",
+                "agent_id": "billing-agent"
+            }),
+            &secret,
+        );
+
+        let err = verifier.verify_token(&token).await;
+        assert!(matches!(err, Err(KeelwayError::Auth(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn weak_hs256_secret_is_rejected() {
+        let mut cfg = test_config();
+        cfg.hs256_secret = Some("too-short-secret".to_owned());
+
+        let err = JwtVerifier::new(cfg);
+        assert!(matches!(err, Err(KeelwayError::Config(_))));
+    }
+
+    #[test]
+    fn plain_http_non_local_jwks_url_is_rejected() {
+        let mut cfg = test_config();
+        cfg.hs256_secret = None;
+        cfg.jwks_url = Some("http://idp.example.com/.well-known/jwks.json".to_owned());
+        assert!(matches!(
+            JwtVerifier::new(cfg),
+            Err(KeelwayError::Config(_))
+        ));
+
+        let mut spoofed_local = test_config();
+        spoofed_local.hs256_secret = None;
+        spoofed_local.jwks_url = Some("http://localhost.evil.com/jwks.json".to_owned());
+        assert!(matches!(
+            JwtVerifier::new(spoofed_local),
+            Err(KeelwayError::Config(_))
+        ));
+
+        let mut local_cfg = test_config();
+        local_cfg.hs256_secret = None;
+        local_cfg.jwks_url = Some("http://127.0.0.1:8080/.well-known/jwks.json".to_owned());
+        assert!(JwtVerifier::new(local_cfg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn spki_ed25519_key_verifies_token_and_returns_exp() -> Result<(), KeelwayError> {
+        let seed: [u8; 32] = [7u8; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+
+        let mut spki_bytes = Vec::with_capacity(44);
+        spki_bytes.extend_from_slice(&ED25519_SPKI_PREFIX);
+        spki_bytes.extend_from_slice(&pub_bytes);
+
+        let mut pkcs8_der = Vec::with_capacity(48);
+        pkcs8_der.extend_from_slice(&[
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ]);
+        pkcs8_der.extend_from_slice(&seed);
+
+        let mut cfg = test_config();
+        cfg.hs256_secret = None;
+        cfg.ed25519_public_key_hex = Some(hex::encode(&spki_bytes));
+        let verifier = JwtVerifier::new(cfg)?;
+
+        let exp = (Utc::now().timestamp() + 300) as u64;
+        let token = encode(
+            &Header::new(Algorithm::EdDSA),
+            &json!({
+                "iss": "https://idp.keelway.test",
+                "aud": "keelway-gateway",
+                "exp": exp,
+                "org_id": "acme-corp",
+                "agent_id": "eddsa-agent",
+                "roles": ["admin"]
+            }),
+            &EncodingKey::from_ed_der(&pkcs8_der),
+        )
+        .unwrap_or_default();
+
+        let (principal, got_exp) = verifier.verify_token_with_exp(&token).await?;
+        assert_eq!(principal.org_id, "acme-corp");
+        assert_eq!(principal.agent_id, "eddsa-agent");
+        assert_eq!(principal.roles, vec!["admin"]);
+        assert_eq!(got_exp, Some(exp));
         Ok(())
     }
 }
