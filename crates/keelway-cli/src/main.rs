@@ -3,7 +3,7 @@ use keelway_engine::{
     Decision, GatewayEngine, PolicyTestCase, ReplayVerdict, UpstreamTransport, core::GatewayConfig,
     validate_server_alias,
 };
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -122,7 +122,31 @@ enum TraceAction {
         /// Optional hex-encoded Ed25519 verifying (public) key to verify receipt signatures
         #[arg(long)]
         public_key: Option<String>,
+        /// Print only the last N matching receipts (still verifies the full chain)
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Filter printed receipts by provenance.trace_id
+        #[arg(long)]
+        trace_id: Option<String>,
+        /// Filter printed receipts by policy decision
+        #[arg(long, value_enum)]
+        decision: Option<TraceDecisionFilter>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TraceDecisionFilter {
+    Allow,
+    Deny,
+}
+
+impl TraceDecisionFilter {
+    fn matches(self, decision: Decision) -> bool {
+        match (self, decision) {
+            (Self::Allow, Decision::Allow) | (Self::Deny, Decision::Deny) => true,
+            (Self::Allow, Decision::Deny) | (Self::Deny, Decision::Allow) => false,
+        }
+    }
 }
 
 #[tokio::main]
@@ -262,55 +286,23 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             })
         }
         Commands::Trace {
-            action: TraceAction::Inspect { tape, public_key },
+            action:
+                TraceAction::Inspect {
+                    tape,
+                    public_key,
+                    tail,
+                    trace_id,
+                    decision,
+                },
         } => {
-            let verification = GatewayEngine::inspect_tape(&tape, |r| {
-                if let Some(ref vk) = public_key {
-                    let sig_hex = r
-                        .provenance
-                        .as_ref()
-                        .and_then(|p| p.get("signature_hex"))
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            keelway_engine::core::KeelwayError::Tape(format!(
-                                "missing Ed25519 provenance signature at seq {}",
-                                r.seq
-                            ))
-                        })?;
-                    keelway_engine::provenance::TapeSigner::verify_hex(
-                        vk,
-                        r.entry_hash.as_bytes(),
-                        sig_hex,
-                    )?;
-                }
-                let badge = match r.decision {
-                    Decision::Allow => "ALLOWED",
-                    Decision::Deny => "BLOCKED",
-                };
-                println!(
-                    "#{:<4} {:?} {:<26} {:<16} {:<8} | {}",
-                    r.seq,
-                    r.state,
-                    format!("{}.{}", r.server, r.tool),
-                    r.agent_id,
-                    badge,
-                    r.explanation.reason
-                );
-                Ok(())
-            })?;
-            if public_key.is_some() {
-                println!(
-                    "tape #{} chain and Ed25519 signatures verified (head: {})",
-                    verification.count,
-                    &verification.head_hash[..16.min(verification.head_hash.len())]
-                );
-            } else {
-                println!(
-                    "tape #{} chain verified (head: {})",
-                    verification.count,
-                    &verification.head_hash[..16.min(verification.head_hash.len())]
-                );
-            }
+            inspect_tape_to_writer(
+                &tape,
+                public_key.as_deref(),
+                tail,
+                trace_id.as_deref(),
+                decision,
+                &mut std::io::stdout(),
+            )?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Replay {
@@ -397,6 +389,111 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Streams and verifies every receipt in `tape`, filtering and tailing formatted lines to `out`.
+fn inspect_tape_to_writer(
+    tape: &Path,
+    public_key: Option<&str>,
+    tail: Option<usize>,
+    trace_id: Option<&str>,
+    decision: Option<TraceDecisionFilter>,
+    out: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tail_buf = tail.map(|n| VecDeque::with_capacity(n.min(1024)));
+    let verification = GatewayEngine::inspect_tape(tape, |r| {
+        if let Some(vk) = public_key {
+            let sig_hex = r
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("signature_hex"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    keelway_engine::core::KeelwayError::Tape(format!(
+                        "missing Ed25519 provenance signature at seq {}",
+                        r.seq
+                    ))
+                })?;
+            keelway_engine::provenance::TapeSigner::verify_hex(
+                vk,
+                r.entry_hash.as_bytes(),
+                sig_hex,
+            )?;
+        }
+
+        let receipt_trace_id = r
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("trace_id"))
+            .and_then(|v| v.as_str());
+
+        if let Some(target_trace_id) = trace_id
+            && receipt_trace_id.is_none_or(|tid| !tid.eq_ignore_ascii_case(target_trace_id))
+        {
+            return Ok(());
+        }
+        if let Some(target_decision) = decision
+            && !target_decision.matches(r.decision)
+        {
+            return Ok(());
+        }
+
+        let badge = match r.decision {
+            Decision::Allow => "ALLOWED",
+            Decision::Deny => "BLOCKED",
+        };
+        let trace_snippet = match receipt_trace_id {
+            Some(tid) => format!(" trace={tid}"),
+            None => String::new(),
+        };
+        let line = format!(
+            "#{:<4} {:?} {:<26} {:<16} {:<8}{} | {}",
+            r.seq,
+            r.state,
+            format!("{}.{}", r.server, r.tool),
+            r.agent_id,
+            badge,
+            trace_snippet,
+            r.explanation.reason
+        );
+
+        if let Some(limit) = tail {
+            if limit > 0
+                && let Some(ref mut buf) = tail_buf
+            {
+                if buf.len() == limit {
+                    buf.pop_front();
+                }
+                buf.push_back(line);
+            }
+        } else {
+            writeln!(out, "{line}")?;
+        }
+        Ok(())
+    })?;
+
+    if let Some(buf) = tail_buf {
+        for line in buf {
+            writeln!(out, "{line}")?;
+        }
+    }
+
+    if public_key.is_some() {
+        writeln!(
+            out,
+            "tape #{} chain and Ed25519 signatures verified (head: {})",
+            verification.count,
+            &verification.head_hash[..16.min(verification.head_hash.len())]
+        )?;
+    } else {
+        writeln!(
+            out,
+            "tape #{} chain verified (head: {})",
+            verification.count,
+            &verification.head_hash[..16.min(verification.head_hash.len())]
+        )?;
+    }
+    Ok(())
 }
 
 struct DoctorCheck {
@@ -1143,6 +1240,134 @@ mod tests {
             "--dry-run".as_ref(),
         ]))?;
         assert_eq!(run(replay_cli).await?, ExitCode::SUCCESS);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_trace_inspect_filters_by_tail_trace_id_and_decision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("trace-inspect-filters")?;
+        let dir = tmp.path();
+        let tape = dir.join("keelway-tape.jsonl");
+        let signer = keelway_engine::provenance::TapeSigner::from_seed_str(
+            "0101010101010101010101010101010101010101010101010101010101010101",
+        )?;
+        let vk_hex = signer.verifying_key_hex();
+
+        let fixtures = [
+            (
+                1u64,
+                keelway_engine::GENESIS_HASH,
+                "c793c63c372e7110deb1a344c2aef56350e5a85e78f9263ab2fa426fd4dd0bff",
+                "ALLOW",
+                "trace-a",
+                "allow-a-1",
+            ),
+            (
+                2u64,
+                "c793c63c372e7110deb1a344c2aef56350e5a85e78f9263ab2fa426fd4dd0bff",
+                "0465ab0d5b1cbc092a98a2cd3672b07d53a91481a8e2b43058b1aded3e19cf36",
+                "DENY",
+                "trace-a",
+                "deny-a-2",
+            ),
+            (
+                3u64,
+                "0465ab0d5b1cbc092a98a2cd3672b07d53a91481a8e2b43058b1aded3e19cf36",
+                "d4be1ae2d6856d9896146e44282a6d4b085bd3b6a4bc72e1d7d0477f6a3bfc4a",
+                "DENY",
+                "trace-b",
+                "deny-b-3",
+            ),
+            (
+                4u64,
+                "d4be1ae2d6856d9896146e44282a6d4b085bd3b6a4bc72e1d7d0477f6a3bfc4a",
+                "99f016da4687e3a9b9b6fde670416320725e4bc0bb51036a725658b37e994e47",
+                "DENY",
+                "trace-a",
+                "deny-a-4",
+            ),
+        ];
+
+        let mut lines = String::new();
+        for (seq, prev_hash, entry_hash, dec, trace_id, reason) in fixtures {
+            let sig_hex = signer.sign_hex(entry_hash.as_bytes());
+            let receipt: keelway_engine::Receipt = serde_json::from_value(serde_json::json!({
+                "seq": seq,
+                "prev_hash": prev_hash,
+                "entry_hash": entry_hash,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "org_id": "acme",
+                "agent_id": "coding-agent",
+                "server": "local-fs",
+                "tool": "read_file",
+                "redacted_args": {},
+                "redacted_fields": [],
+                "decision": dec,
+                "explanation": {
+                    "decision": dec,
+                    "rule_ids": [],
+                    "validator_outcomes": [],
+                    "reason": reason,
+                    "policy_digest": "abc123"
+                },
+                "policy_digest": "abc123",
+                "state": "SEALED",
+                "provenance": {
+                    "trace_id": trace_id,
+                    "key_id": signer.key_id(),
+                    "signature_hex": sig_hex
+                }
+            }))?;
+            lines.push_str(&serde_json::to_string(&receipt)?);
+            lines.push('\n');
+        }
+        fs::write(&tape, lines)?;
+
+        // 1. CLI parsing + execution with --tail, --trace-id, --decision deny, --public-key
+        let cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "trace".as_ref(),
+            "inspect".as_ref(),
+            "--tape".as_ref(),
+            tape.as_os_str(),
+            "--public-key".as_ref(),
+            vk_hex.as_ref(),
+            "--tail".as_ref(),
+            "1".as_ref(),
+            "--trace-id".as_ref(),
+            "trace-a".as_ref(),
+            "--decision".as_ref(),
+            "deny".as_ref(),
+        ]))?;
+        assert_eq!(run(cli).await?, ExitCode::SUCCESS);
+
+        // 2. Verify filtered & tailed output lines directly
+        let mut out = Vec::new();
+        inspect_tape_to_writer(
+            &tape,
+            Some(&vk_hex),
+            Some(1),
+            Some("trace-a"),
+            Some(TraceDecisionFilter::Deny),
+            &mut out,
+        )?;
+        let output = String::from_utf8(out)?;
+        assert!(!output.contains("allow-a-1"));
+        assert!(!output.contains("deny-a-2"));
+        assert!(!output.contains("deny-b-3"));
+        assert!(output.contains("deny-a-4"));
+        assert!(output.contains("trace=trace-a"));
+        assert!(output.contains("tape #4 chain and Ed25519 signatures verified"));
+
+        // 3. --tail 0 prints no receipt lines, still verifies full chain
+        let mut zero_out = Vec::new();
+        inspect_tape_to_writer(&tape, None, Some(0), None, None, &mut zero_out)?;
+        let zero_output = String::from_utf8(zero_out)?;
+        assert!(!zero_output.contains("allow-a-1"));
+        assert!(!zero_output.contains("deny-a-4"));
+        assert!(zero_output.contains("tape #4 chain verified"));
 
         Ok(())
     }
