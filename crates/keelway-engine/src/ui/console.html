@@ -933,7 +933,7 @@
       function matchesStreamFilter(ev, filterVal, query) {
         var outcome = String(ev && ev.outcome || '').toLowerCase();
         if (filterVal === 'allowed') {
-          if (outcome !== 'allowed') {
+          if (outcome !== 'allowed' && outcome !== 'p10approved') {
             return false;
           }
         } else if (filterVal === 'denied') {
@@ -1042,13 +1042,19 @@
         els.streamList.appendChild(frag);
       }
 
+      var pausedBufferedEvents = [];
+
       function pushStreamEvent(ev) {
+        if (streamPaused) {
+          pausedBufferedEvents.unshift(ev);
+          if (pausedBufferedEvents.length > MAX_STREAM_EVENTS) {
+            pausedBufferedEvents.length = MAX_STREAM_EVENTS;
+          }
+          return;
+        }
         streamEvents.unshift(ev);
         if (streamEvents.length > MAX_STREAM_EVENTS) {
           streamEvents.length = MAX_STREAM_EVENTS;
-        }
-        if (streamPaused) {
-          return;
         }
         renderStream();
       }
@@ -1233,12 +1239,20 @@
         els.streamPauseBtn.textContent = streamPaused ? 'Resume' : 'Pause';
         setStreamStatus(baseStreamStatus);
         if (!streamPaused) {
+          if (pausedBufferedEvents.length > 0) {
+            streamEvents = pausedBufferedEvents.concat(streamEvents);
+            if (streamEvents.length > MAX_STREAM_EVENTS) {
+              streamEvents.length = MAX_STREAM_EVENTS;
+            }
+            pausedBufferedEvents = [];
+          }
           renderStream();
         }
       });
 
       els.streamClearBtn.addEventListener('click', function () {
         streamEvents = [];
+        pausedBufferedEvents = [];
         renderStream();
       });
 
