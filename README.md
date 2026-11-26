@@ -75,7 +75,7 @@ Additional lifecycle commands:
 - `keelway gateway up --config ./demo/keelway.yaml` — start the federated MCP gateway
 - `keelway doctor --config ./demo/keelway.yaml` — run offline pre-flight production readiness and security diagnostics
 - `keelway keygen` — generate an Ed25519 signing keypair for audit tape provenance
-- `keelway trace inspect --tape ./demo/keelway-tape.jsonl [--public-key <HEX>] [--tail <N>] [--trace-id <ID>] [--decision <DECISION>]` — verify the SHA-256 receipt chain (and optional Ed25519 signatures) and inspect structured decisions with optional tail, trace ID, and decision filters
+- `keelway trace inspect --tape ./demo/keelway-tape.jsonl [--public-key <HEX>] [--tail <N>] [--trace-id <ID>] [--decision <DECISION>] [--outcome <OUTCOME>]` — verify the SHA-256 receipt chain (and optional Ed25519 signatures) and inspect structured decisions with optional tail, trace ID, decision, and outcome filters
 - `keelway replay --dry-run` — replay recorded receipts offline against candidate `.cedar` policies (flags `INDETERMINATE` if a validator inspects a scrubbed field)
 
 ## Configuration Reference
@@ -102,13 +102,13 @@ Additional lifecycle commands:
 
 ## Benchmarks
 
-Measured local release benchmarks (`cargo bench -p keelway-engine --bench gateway_overhead`, `macOS Apple Silicon`, `rustc 1.100.0`, `2026-11-25`):
+Measured local release benchmarks (`cargo bench -p keelway-engine --bench gateway_overhead`, `macOS Apple Silicon`, `rustc 1.100.0`, `keelway-engine v0.3.0`, `2026-11-26`):
 
 | Path Measured | Sample Size | p50 | p95 | p99 | Target / Notes |
 |---|---:|---:|---:|---:|---|
-| `scrub_json` (Aho-Corasick) + Cedar + `repo_allowlist` | `N = 2,000` | `0.021 ms` | `0.052 ms` | `0.129 ms` | `< 5.0 ms` p95 (in-memory hot path) |
-| `scrub_json` (Aho-Corasick) + Cedar + `sqlparser` AST (`sql_readonly`) | `N = 2,000` | `0.032 ms` | `0.121 ms` | `0.300 ms` | `< 5.0 ms` p95 (in-memory hot path) |
-| `TapeWriter::append` 50-way concurrent burst (`sync_data()` + SHA-256 chain) | `N = 500` (`10x50`) | `3.906 ms` | `11.855 ms` | `11.857 ms` | Dedicated OS-thread group-commit (`<= 128` receipts/fsync) + full chain verification |
+| `scrub_json` (Aho-Corasick) + Cedar + `repo_allowlist` | `N = 2,000` | `0.022 ms` | `0.110 ms` | `0.426 ms` | `< 5.0 ms` p95 (in-memory hot path) |
+| `scrub_json` (Aho-Corasick) + Cedar + `sqlparser` AST (`sql_readonly`) | `N = 2,000` | `0.040 ms` | `0.079 ms` | `0.189 ms` | `< 5.0 ms` p95 (in-memory hot path) |
+| `TapeWriter::append` 50-way concurrent burst (`sync_data()` + SHA-256 chain) | `N = 500` (`10x50`) | `4.509 ms` | `7.394 ms` | `7.408 ms` | Dedicated OS-thread group-commit (`<= 128` receipts/fsync) + full chain verification |
 
 See [benchmarks/competitor-dx-notes.md](benchmarks/competitor-dx-notes.md) for methodology and comparative DX notes.
 

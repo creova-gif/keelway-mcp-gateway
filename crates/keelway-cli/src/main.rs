@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use keelway_engine::{
-    Decision, GatewayEngine, PolicyTestCase, ReplayVerdict, UpstreamTransport, core::GatewayConfig,
-    validate_server_alias,
+    Decision, ExecutionOutcome, GatewayEngine, PolicyTestCase, ReplayVerdict, UpstreamTransport,
+    core::GatewayConfig, validate_server_alias,
 };
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -131,6 +131,9 @@ enum TraceAction {
         /// Filter printed receipts by policy decision
         #[arg(long, value_enum)]
         decision: Option<TraceDecisionFilter>,
+        /// Filter printed receipts by execution outcome
+        #[arg(long, value_enum)]
+        outcome: Option<TraceOutcomeFilter>,
     },
 }
 
@@ -146,6 +149,24 @@ impl TraceDecisionFilter {
             (Self::Allow, Decision::Allow) | (Self::Deny, Decision::Deny) => true,
             (Self::Allow, Decision::Deny) | (Self::Deny, Decision::Allow) => false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TraceOutcomeFilter {
+    Ok,
+    Timeout,
+    Crashed,
+}
+
+impl TraceOutcomeFilter {
+    fn matches(self, outcome: Option<ExecutionOutcome>) -> bool {
+        matches!(
+            (self, outcome),
+            (Self::Ok, Some(ExecutionOutcome::Ok))
+                | (Self::Timeout, Some(ExecutionOutcome::Timeout))
+                | (Self::Crashed, Some(ExecutionOutcome::Crashed))
+        )
     }
 }
 
@@ -293,6 +314,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     tail,
                     trace_id,
                     decision,
+                    outcome,
                 },
         } => {
             inspect_tape_to_writer(
@@ -301,6 +323,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 tail,
                 trace_id.as_deref(),
                 decision,
+                outcome,
                 &mut std::io::stdout(),
             )?;
             Ok(ExitCode::SUCCESS)
@@ -398,6 +421,7 @@ fn inspect_tape_to_writer(
     tail: Option<usize>,
     trace_id: Option<&str>,
     decision: Option<TraceDecisionFilter>,
+    outcome: Option<TraceOutcomeFilter>,
     out: &mut impl Write,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut tail_buf = tail.map(|n| VecDeque::with_capacity(n.min(1024)));
@@ -437,6 +461,11 @@ fn inspect_tape_to_writer(
         {
             return Ok(());
         }
+        if let Some(target_outcome) = outcome
+            && !target_outcome.matches(r.outcome)
+        {
+            return Ok(());
+        }
 
         let badge = match r.decision {
             Decision::Allow => "ALLOWED",
@@ -446,14 +475,20 @@ fn inspect_tape_to_writer(
             Some(tid) => format!(" trace={tid}"),
             None => String::new(),
         };
+        let outcome_snippet = match r.outcome {
+            Some(ExecutionOutcome::Timeout) => " outcome=Timeout",
+            Some(ExecutionOutcome::Crashed) => " outcome=Crashed",
+            Some(ExecutionOutcome::Ok) | None => "",
+        };
         let line = format!(
-            "#{:<4} {:?} {:<26} {:<16} {:<8}{} | {}",
+            "#{:<4} {:?} {:<26} {:<16} {:<8}{}{} | {}",
             r.seq,
             r.state,
             format!("{}.{}", r.server, r.tool),
             r.agent_id,
             badge,
             trace_snippet,
+            outcome_snippet,
             r.explanation.reason
         );
 
@@ -1351,6 +1386,7 @@ mod tests {
             Some(1),
             Some("trace-a"),
             Some(TraceDecisionFilter::Deny),
+            None,
             &mut out,
         )?;
         let output = String::from_utf8(out)?;
@@ -1363,11 +1399,132 @@ mod tests {
 
         // 3. --tail 0 prints no receipt lines, still verifies full chain
         let mut zero_out = Vec::new();
-        inspect_tape_to_writer(&tape, None, Some(0), None, None, &mut zero_out)?;
+        inspect_tape_to_writer(&tape, None, Some(0), None, None, None, &mut zero_out)?;
         let zero_output = String::from_utf8(zero_out)?;
         assert!(!zero_output.contains("allow-a-1"));
         assert!(!zero_output.contains("deny-a-4"));
         assert!(zero_output.contains("tape #4 chain verified"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_trace_inspect_filters_by_outcome() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDirGuard::new("trace-inspect-outcome")?;
+        let dir = tmp.path();
+        let tape = dir.join("keelway-tape.jsonl");
+
+        let fixtures = [
+            (
+                1u64,
+                keelway_engine::GENESIS_HASH,
+                "801ea719b843217156bad4fdad3b9fbeea09585b2ef41abf6fe675522e74c1fc",
+                "ALLOW",
+                Some("ok"),
+                "allow-ok-1",
+            ),
+            (
+                2u64,
+                "801ea719b843217156bad4fdad3b9fbeea09585b2ef41abf6fe675522e74c1fc",
+                "549999f41fc208f65d713579eb60016d23ff23642567afd65cab18eb250778e3",
+                "ALLOW",
+                Some("timeout"),
+                "allow-timeout-2",
+            ),
+            (
+                3u64,
+                "549999f41fc208f65d713579eb60016d23ff23642567afd65cab18eb250778e3",
+                "08abb5ff448bbbdd4f1a53210433d50d5e519d3402a72e41cba6d8021e929f12",
+                "ALLOW",
+                Some("crashed"),
+                "allow-crashed-3",
+            ),
+            (
+                4u64,
+                "08abb5ff448bbbdd4f1a53210433d50d5e519d3402a72e41cba6d8021e929f12",
+                "7e5e465ebf7e094ffcd3e3dbb3190c2e36507253bba215a9fcc1e3ab174c4179",
+                "DENY",
+                None,
+                "deny-none-4",
+            ),
+        ];
+
+        let mut lines = String::new();
+        for (seq, prev_hash, entry_hash, dec, outcome, reason) in fixtures {
+            let receipt: keelway_engine::Receipt = serde_json::from_value(serde_json::json!({
+                "seq": seq,
+                "prev_hash": prev_hash,
+                "entry_hash": entry_hash,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "org_id": "acme",
+                "agent_id": "coding-agent",
+                "server": "local-fs",
+                "tool": "read_file",
+                "redacted_args": {},
+                "redacted_fields": [],
+                "decision": dec,
+                "explanation": {
+                    "decision": dec,
+                    "rule_ids": [],
+                    "validator_outcomes": [],
+                    "reason": reason,
+                    "policy_digest": "abc123"
+                },
+                "policy_digest": "abc123",
+                "state": "SEALED",
+                "outcome": outcome,
+            }))?;
+            lines.push_str(&serde_json::to_string(&receipt)?);
+            lines.push('\n');
+        }
+        fs::write(&tape, lines)?;
+
+        let cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "trace".as_ref(),
+            "inspect".as_ref(),
+            "--tape".as_ref(),
+            tape.as_os_str(),
+            "--outcome".as_ref(),
+            "timeout".as_ref(),
+        ]))?;
+        assert_eq!(run(cli).await?, ExitCode::SUCCESS);
+
+        let mut timeout_out = Vec::new();
+        inspect_tape_to_writer(
+            &tape,
+            None,
+            None,
+            None,
+            None,
+            Some(TraceOutcomeFilter::Timeout),
+            &mut timeout_out,
+        )?;
+        let timeout_output = String::from_utf8(timeout_out)?;
+        assert!(!timeout_output.contains("allow-ok-1"));
+        assert!(timeout_output.contains("allow-timeout-2"));
+        assert!(timeout_output.contains("outcome=Timeout"));
+        assert!(!timeout_output.contains("allow-crashed-3"));
+        assert!(!timeout_output.contains("deny-none-4"));
+        assert!(timeout_output.contains("tape #4 chain verified"));
+
+        let mut crashed_out = Vec::new();
+        inspect_tape_to_writer(
+            &tape,
+            None,
+            None,
+            None,
+            None,
+            Some(TraceOutcomeFilter::Crashed),
+            &mut crashed_out,
+        )?;
+        let crashed_output = String::from_utf8(crashed_out)?;
+        assert!(!crashed_output.contains("allow-ok-1"));
+        assert!(!crashed_output.contains("allow-timeout-2"));
+        assert!(crashed_output.contains("allow-crashed-3"));
+        assert!(crashed_output.contains("outcome=Crashed"));
+        assert!(!crashed_output.contains("deny-none-4"));
+        assert!(crashed_output.contains("tape #4 chain verified"));
 
         Ok(())
     }
