@@ -411,6 +411,30 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
         }
     }
 
+    let mut signing_vk: Option<String> = None;
+    if let Some(key_ref) = &config.signing_key_ref {
+        match resolve_secret_ref_value(key_ref).and_then(|seed| {
+            keelway_engine::provenance::TapeSigner::from_seed_str(&seed).map_err(|e| e.to_string())
+        }) {
+            Ok(signer) => {
+                signing_vk = Some(signer.verifying_key_hex());
+                checks.push(DoctorCheck {
+                    status: "PASS",
+                    name: "Signing Key".to_owned(),
+                    detail: format!("Ed25519 key '{}' loaded", signer.key_id()),
+                });
+            }
+            Err(msg) => {
+                failures += 1;
+                checks.push(DoctorCheck {
+                    status: "FAIL",
+                    name: "Signing Key".to_owned(),
+                    detail: msg,
+                });
+            }
+        }
+    }
+
     let secret_refs = collect_secret_refs(&config);
     if secret_refs.is_empty() {
         checks.push(DoctorCheck {
@@ -476,7 +500,7 @@ fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>
         base_dir.join(&config.tape_path)
     };
     if tape_path.exists() {
-        match GatewayEngine::verify_tape(&tape_path) {
+        match GatewayEngine::verify_tape_with_key(&tape_path, signing_vk.as_deref()) {
             Ok(verification) => {
                 let short_head = &verification.head_hash[..16.min(verification.head_hash.len())];
                 checks.push(DoctorCheck {
@@ -520,6 +544,17 @@ fn validate_config_bindings(config: &GatewayConfig) -> Result<(), String> {
         validate_server_alias(&server.alias).map_err(|e| e.to_string())?;
         if !seen_aliases.insert(server.alias.as_str()) {
             return Err(format!("duplicate server alias '{}'", server.alias));
+        }
+    }
+
+    let mut seen_tools: HashSet<String> = HashSet::new();
+    for server in &config.servers {
+        for tool in &server.tools {
+            let fed_name = keelway_engine::sanitize_federated_name(&server.alias, tool)
+                .map_err(|e| e.to_string())?;
+            if !seen_tools.insert(fed_name.clone()) {
+                return Err(format!("duplicate federated tool name '{fed_name}'"));
+            }
         }
     }
 
@@ -580,27 +615,46 @@ fn collect_secret_refs(config: &GatewayConfig) -> Vec<(String, String)> {
     refs
 }
 
-fn check_secret_ref(reference: &str) -> Result<(), String> {
+fn resolve_secret_ref_value(reference: &str) -> Result<String, String> {
     if let Some(var_name) = reference.strip_prefix("secret://env/") {
         if var_name.is_empty() {
             return Err("empty environment variable name in secret://env/".to_owned());
         }
-        std::env::var(var_name)
-            .map(|_| ())
-            .map_err(|_| format!("environment variable '{var_name}' is not set"))
+        std::env::var(var_name).map_err(|_| format!("environment variable '{var_name}' is not set"))
     } else if let Some(file_path) = reference.strip_prefix("secret://file/") {
         if file_path.is_empty() {
             return Err("empty file path in secret://file/".to_owned());
         }
         fs::read_to_string(file_path)
-            .map(|_| ())
             .map_err(|e| format!("failed to read secret file '{file_path}': {e}"))
     } else if reference.starts_with("secret://gcp/") {
         Err("GCP Secret Manager provider is a Milestone 2+ plugin seam; use secret://env/ or secret://file/ in Milestone 1".to_owned())
     } else if reference.starts_with("secret://") {
         Err(format!("unsupported secret scheme in '{reference}'"))
     } else {
-        Ok(())
+        Ok(reference.to_owned())
+    }
+}
+
+fn check_secret_ref(reference: &str) -> Result<(), String> {
+    resolve_secret_ref_value(reference).map(|_| ())
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -609,10 +663,11 @@ fn command_exists(cmd: &str) -> bool {
         return false;
     }
     if cmd.contains('/') || cmd.contains('\\') {
-        return Path::new(cmd).exists();
+        return is_executable_file(Path::new(cmd));
     }
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).exists()))
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| is_executable_file(&dir.join(cmd)))
+    })
 }
 
 fn print_doctor_summary(checks: &[DoctorCheck]) {
@@ -1011,6 +1066,11 @@ mod tests {
         fs::write(&secret_file, "super-secret-value-not-printed\n")?;
         let stdio_bin = dir.join("mock-mcp-bin");
         fs::write(&stdio_bin, "#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stdio_bin, fs::Permissions::from_mode(0o755))?;
+        }
         let tape = dir.join("keelway-tape.jsonl");
         fs::write(&tape, "")?;
 

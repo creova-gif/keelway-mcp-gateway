@@ -544,7 +544,7 @@ impl GatewayRuntime {
                             policy_digest: String::new(),
                             state: ReceiptState::Blocked,
                             outcome: None,
-                            provenance: None,
+                            provenance: base_provenance.clone(),
                         })
                         .await;
                     return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
@@ -598,7 +598,7 @@ impl GatewayRuntime {
                         policy_digest: scrubbed_explanation.policy_digest.clone(),
                         state: ReceiptState::Blocked,
                         outcome: None,
-                        provenance: None,
+                        provenance: base_provenance.clone(),
                     };
 
                     // Fail-closed: receipt MUST persist before returning decision
@@ -665,7 +665,7 @@ impl GatewayRuntime {
                                 policy_digest: budget_explanation.policy_digest.clone(),
                                 state: ReceiptState::Blocked,
                                 outcome: None,
-                                provenance: None,
+                                provenance: base_provenance.clone(),
                             })
                             .await;
                         self.metrics.record_event(LiveConsoleEvent {
@@ -796,7 +796,7 @@ impl GatewayRuntime {
                                 policy_digest: deny_expl.policy_digest.clone(),
                                 state: ReceiptState::Blocked,
                                 outcome: None,
-                                provenance: None,
+                                provenance: base_provenance.clone(),
                             })
                             .await;
                         self.metrics.record_event(LiveConsoleEvent {
@@ -841,7 +841,7 @@ impl GatewayRuntime {
                                     policy_digest: re_expl.policy_digest.clone(),
                                     state: ReceiptState::Blocked,
                                     outcome: None,
-                                    provenance: None,
+                                    provenance: base_provenance.clone(),
                                 })
                                 .await
                             {
@@ -905,7 +905,7 @@ impl GatewayRuntime {
                             policy_digest: seal_expl.policy_digest.clone(),
                             state: ReceiptState::Sealed,
                             outcome: None,
-                            provenance: None,
+                            provenance: base_provenance.clone(),
                         })
                         .await
                     {
@@ -979,7 +979,7 @@ impl GatewayRuntime {
                                     policy_digest: eval.explanation.policy_digest.clone(),
                                     state: ReceiptState::Blocked,
                                     outcome: None,
-                                    provenance: None,
+                                    provenance: base_provenance.clone(),
                                 })
                                 .await;
                             return jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &reason, None);
@@ -1012,7 +1012,7 @@ impl GatewayRuntime {
                                 policy_digest: eval.explanation.policy_digest.clone(),
                                 state: ReceiptState::Blocked,
                                 outcome: None,
-                                provenance: None,
+                                provenance: base_provenance.clone(),
                             })
                             .await;
                         jsonrpc_error(id, JSONRPC_PAYLOAD_TOO_LARGE, &msg, None)
