@@ -725,6 +725,7 @@ mod tests {
             bind_addr: "127.0.0.1:8080".to_owned(),
             tape_path: PathBuf::from("keelway-tape.jsonl"),
             policy_files: vec![],
+            budgets: vec![],
             principals: vec![
                 PrincipalConfig {
                     org_id: "acme".to_owned(),

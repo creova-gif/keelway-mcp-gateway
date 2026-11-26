@@ -1,0 +1,39 @@
+name: Bug Report
+description: Report a bug, policy enforcement issue, or unexpected failure in Keelway MCP Gateway
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Clear description of the bug and observed vs. expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproduction
+      description: Commands, `keelway.yaml`, Cedar policy, or `keelway attack simulate` scenario to reproduce.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Keelway Version / Commit
+      placeholder: "v0.1.2 or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Platform & Rust Version
+      placeholder: "aarch64-apple-darwin / x86_64-unknown-linux-gnu, rustc 1.85+"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Output / Logs
+      description: Sanitized CLI output, JSON-RPC error payload, or `keelway trace inspect` output (redact any secrets).
+      render: shell

@@ -1,3 +1,4 @@
+pub(crate) mod budget;
 pub mod core;
 pub(crate) mod mcp;
 pub(crate) mod policy;
@@ -17,9 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use crate::core::{
-    Decision, ExecutionOutcome, Explanation, PrincipalConfig, Receipt, ReceiptState, ServerConfig,
-    UpstreamTransport, ValidatorBinding, ValidatorKind, ValidatorOutcome, sanitize_federated_name,
-    validate_server_alias,
+    BudgetConfig, BudgetRule, Decision, ExecutionOutcome, Explanation, PrincipalConfig, Receipt,
+    ReceiptState, ServerConfig, UpstreamTransport, ValidatorBinding, ValidatorKind,
+    ValidatorOutcome, sanitize_federated_name, validate_server_alias,
 };
 pub use crate::secrets::{REDACTED_PLACEHOLDER, SecretProvider, SecretScrubber, StreamingScrubber};
 pub use crate::tape::{GENESIS_HASH, ReplayVerdict};

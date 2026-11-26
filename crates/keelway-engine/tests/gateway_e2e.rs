@@ -4,8 +4,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 use keelway_engine::core::{Decision, GatewayConfig, KeelwayError};
 use keelway_engine::{
-    ExecutionOutcome, GatewayEngine, PrincipalConfig, Receipt, ReceiptState, ReplayVerdict,
-    SecretProvider, ServerConfig, UpstreamTransport, ValidatorBinding, ValidatorKind,
+    BudgetRule, ExecutionOutcome, GatewayEngine, PrincipalConfig, Receipt, ReceiptState,
+    ReplayVerdict, SecretProvider, ServerConfig, UpstreamTransport, ValidatorBinding,
+    ValidatorKind,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -130,6 +131,7 @@ async fn end_to_end_three_server_federation_secret_isolation_and_replay() -> Res
         bind_addr: "127.0.0.1:0".to_owned(),
         tape_path: tape_path.clone(),
         policy_files: vec![],
+        budgets: vec![],
         principals: vec![
             PrincipalConfig {
                 org_id: "acme".to_owned(),
@@ -381,6 +383,7 @@ async fn stdio_upstream_federation_injects_env_and_scrubs_stdout_and_stderr()
         bind_addr: "127.0.0.1:0".to_owned(),
         tape_path: tape_path.clone(),
         policy_files: vec![],
+        budgets: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -470,6 +473,7 @@ async fn stdio_upstream_timeout_returns_32002_and_records_timeout_receipt()
         bind_addr: "127.0.0.1:0".to_owned(),
         tape_path: tape_path.clone(),
         policy_files: vec![],
+        budgets: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -550,6 +554,7 @@ async fn stdio_upstream_crash_returns_32003_and_records_crashed_receipt() -> Res
         bind_addr: "127.0.0.1:0".to_owned(),
         tape_path: tape_path.clone(),
         policy_files: vec![],
+        budgets: vec![],
         principals: vec![PrincipalConfig {
             org_id: "acme".to_owned(),
             agent_id: "coding-agent".to_owned(),
@@ -749,5 +754,190 @@ forbid(
     assert_eq!(blocked_resp["error"]["code"], -32000);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_budget_blocks_excess_calls_with_32004_and_records_deny_receipt()
+-> Result<(), KeelwayError> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let db_url = spawn_mock_mcp_server(None, calls.clone()).await?;
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-tape.jsonl");
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        budgets: vec![BudgetRule {
+            org_id: "acme".to_owned(),
+            agent_id: "research-agent".to_owned(),
+            server: "database".to_owned(),
+            max_calls_per_minute: Some(2),
+            max_concurrent_calls: None,
+        }],
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "research-agent".to_owned(),
+            roles: vec!["researcher".to_owned()],
+            token_ref: Some("tok-budget".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "database".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["query_readonly".to_owned()],
+            transport: UpstreamTransport::StreamableHttp {
+                url: db_url,
+                headers: BTreeMap::new(),
+            },
+        }],
+        validators: vec![ValidatorBinding {
+            id: "readonly_sql".to_owned(),
+            server: "database".to_owned(),
+            tool: "query_readonly".to_owned(),
+            arg_name: "sql".to_owned(),
+            kind: ValidatorKind::SqlReadonly,
+        }],
+    };
+
+    let budget_cedar = r#"
+permit(
+    principal in Role::"researcher",
+    action == Action::"call_tool",
+    resource == Tool::"database/query_readonly"
+) when {
+    context.arg_checks.readonly_sql
+};
+"#;
+    let engine = GatewayEngine::from_in_memory(cfg, budget_cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(HashMap::new()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let gw_url = format!("http://{gw_addr}/mcp");
+
+    for id in 1..=2 {
+        let resp: Value = client
+            .post(&gw_url)
+            .header("authorization", "Bearer tok-budget")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": "database__query_readonly", "arguments": { "sql": "SELECT 1" } }
+            }))
+            .send()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+        assert!(resp.get("result").is_some());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // 3rd call within 60s exceeds max_calls_per_minute=2 -> -32004 BudgetExceeded
+    let limited: Value = client
+        .post(&gw_url)
+        .header("authorization", "Bearer tok-budget")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "database__query_readonly", "arguments": { "sql": "SELECT 1" } }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(limited["error"]["code"], -32004);
+    assert_eq!(limited["error"]["message"], "BudgetExceeded");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let verified = GatewayEngine::verify_tape(&tape_path)?;
+    assert!(verified.valid);
+    // 2 ALLOW receipts + 1 pre-budget ALLOW + 1 BudgetExceeded DENY receipt
+    assert!(verified.count >= 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_child_env_clear_isolates_inherited_host_secrets() -> Result<(), KeelwayError> {
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("keelway-tape.jsonl");
+
+    // Child prints CARGO_PKG_NAME (always set in `cargo test` parent, must be empty after env_clear)
+    // and EXPLICIT_VAR (must be present).
+    let script = r#"IFS= read -r line; printf '{"jsonrpc":"2.0","id":1,"result":{"host_leak":"%s","explicit":"%s"}}\n' "${CARGO_PKG_NAME:-}" "${EXPLICIT_VAR:-}" "#;
+    let mut env = BTreeMap::new();
+    env.insert("EXPLICIT_VAR".to_owned(), "allowed_val".to_owned());
+
+    let cfg = GatewayConfig {
+        bind_addr: "127.0.0.1:0".to_owned(),
+        tape_path: tape_path.clone(),
+        policy_files: vec![],
+        budgets: vec![],
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-env".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "envstdio".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["check_env".to_owned()],
+            transport: UpstreamTransport::Stdio {
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), script.to_owned()],
+                env,
+            },
+        }],
+        validators: vec![],
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"envstdio/check_env"
+);
+"#;
+
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path, &MapSecrets(HashMap::new()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    // Note: in Rust 2024 edition `std::env::set_var` is unsafe, so we check PATH (inherited safe baseline)
+    // and ensure arbitrary parent vars like CARGO_PKG_NAME (always set by cargo test!) are NOT leaked.
+    let client = reqwest::Client::new();
+    let resp: Value = client
+        .post(format!("http://{gw_addr}/mcp"))
+        .header("authorization", "Bearer tok-env")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "envstdio__check_env", "arguments": {} }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+
+    assert_eq!(resp["result"]["host_leak"], "");
+    assert_eq!(resp["result"]["explicit"], "allowed_val");
     Ok(())
 }

@@ -24,6 +24,8 @@ pub enum KeelwayError {
     UpstreamTimeout(u64),
     #[error("upstream unavailable: {0}")]
     UpstreamUnavailable(String),
+    #[error("execution budget exceeded: {0}")]
+    BudgetExceeded(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
@@ -167,6 +169,45 @@ pub struct GatewayConfig {
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub validators: Vec<ValidatorBinding>,
+    #[serde(default)]
+    pub budgets: Vec<BudgetRule>,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_bind_addr(),
+            tape_path: default_tape_path(),
+            policy_files: Vec::new(),
+            principals: Vec::new(),
+            servers: Vec::new(),
+            validators: Vec::new(),
+            budgets: Vec::new(),
+        }
+    }
+}
+
+/// Per-principal, per-server execution budget rule configured in `keelway.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetRule {
+    pub org_id: String,
+    /// Agent identifier, or `"*"` for an org-wide default.
+    #[serde(default = "default_wildcard")]
+    pub agent_id: String,
+    /// Server alias, or `"*"` for all servers.
+    #[serde(default = "default_wildcard")]
+    pub server: String,
+    #[serde(default)]
+    pub max_calls_per_minute: Option<u32>,
+    #[serde(default)]
+    pub max_concurrent_calls: Option<u32>,
+}
+
+/// Alias for [`BudgetRule`].
+pub type BudgetConfig = BudgetRule;
+
+fn default_wildcard() -> String {
+    "*".to_owned()
 }
 
 fn default_bind_addr() -> String {
