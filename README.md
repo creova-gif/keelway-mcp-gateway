@@ -1,7 +1,7 @@
 # Keelway MCP Gateway
 
 [![CI](https://github.com/creova-gif/keelway-mcp-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/creova-gif/keelway-mcp-gateway/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v0.1.2-blue.svg)](https://github.com/creova-gif/keelway-mcp-gateway/releases/tag/v0.1.2)
+[![Release](https://img.shields.io/github/v/release/creova-gif/keelway-mcp-gateway)](https://github.com/creova-gif/keelway-mcp-gateway/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
