@@ -160,13 +160,21 @@ enum TraceOutcomeFilter {
 }
 
 impl TraceOutcomeFilter {
-    fn matches(self, outcome: Option<ExecutionOutcome>) -> bool {
-        matches!(
-            (self, outcome),
-            (Self::Ok, Some(ExecutionOutcome::Ok))
-                | (Self::Timeout, Some(ExecutionOutcome::Timeout))
-                | (Self::Crashed, Some(ExecutionOutcome::Crashed))
-        )
+    fn matches(
+        self,
+        decision: Decision,
+        state: keelway_engine::ReceiptState,
+        outcome: Option<ExecutionOutcome>,
+    ) -> bool {
+        match self {
+            Self::Ok => {
+                decision == Decision::Allow
+                    && state == keelway_engine::ReceiptState::Sealed
+                    && matches!(outcome, None | Some(ExecutionOutcome::Ok))
+            }
+            Self::Timeout => matches!(outcome, Some(ExecutionOutcome::Timeout)),
+            Self::Crashed => matches!(outcome, Some(ExecutionOutcome::Crashed)),
+        }
     }
 }
 
@@ -462,7 +470,7 @@ fn inspect_tape_to_writer(
             return Ok(());
         }
         if let Some(target_outcome) = outcome
-            && !target_outcome.matches(r.outcome)
+            && !target_outcome.matches(r.decision, r.state, r.outcome)
         {
             return Ok(());
         }

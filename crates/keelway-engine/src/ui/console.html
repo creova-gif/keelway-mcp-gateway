@@ -44,7 +44,7 @@
       top: 0;
       z-index: 100;
       padding: 8px 14px;
-      background: var(--accent);
+      background: #1d4ed8;
       color: #ffffff;
       font-weight: 600;
       font-size: 13px;
@@ -686,7 +686,17 @@
         }
       }
 
+      var lastPendingKey = null;
+
       function renderPendingGates(items) {
+        var key = items.map(function (item) {
+          return String(item.approval_id || '');
+        }).join(',');
+        if (key === lastPendingKey) {
+          return;
+        }
+        lastPendingKey = key;
+
         clearChildren(els.p10List);
         els.p10Count.textContent = items.length + ' pending';
 
