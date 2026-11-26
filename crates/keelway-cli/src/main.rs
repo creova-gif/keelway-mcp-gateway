@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use keelway_engine::{Decision, GatewayEngine, PolicyTestCase, ReplayVerdict};
+use keelway_engine::{
+    Decision, GatewayEngine, PolicyTestCase, ReplayVerdict, UpstreamTransport, core::GatewayConfig,
+    validate_server_alias,
+};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -51,6 +55,11 @@ enum Commands {
         tape: PathBuf,
         #[arg(long, default_value_t = true)]
         dry_run: bool,
+    },
+    /// Run offline pre-flight production readiness diagnostics
+    Doctor {
+        #[arg(long, default_value = "keelway.yaml")]
+        config: PathBuf,
     },
 }
 
@@ -311,7 +320,318 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Doctor { config } => run_doctor(&config),
     }
+}
+
+struct DoctorCheck {
+    status: &'static str,
+    name: String,
+    detail: String,
+}
+
+fn run_doctor(config_path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let mut checks: Vec<DoctorCheck> = Vec::new();
+    let mut failures = 0usize;
+
+    let raw = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) => {
+            checks.push(DoctorCheck {
+                status: "FAIL",
+                name: "Config".to_owned(),
+                detail: format!("failed to read '{}': {e}", config_path.display()),
+            });
+            print_doctor_summary(&checks);
+            return Err(format!(
+                "doctor failed reading config '{}': {e}",
+                config_path.display()
+            )
+            .into());
+        }
+    };
+
+    let config: GatewayConfig = match serde_yaml::from_str(&raw) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            checks.push(DoctorCheck {
+                status: "FAIL",
+                name: "Config".to_owned(),
+                detail: format!("invalid YAML in '{}': {e}", config_path.display()),
+            });
+            print_doctor_summary(&checks);
+            return Err(format!(
+                "doctor failed parsing config '{}': {e}",
+                config_path.display()
+            )
+            .into());
+        }
+    };
+
+    match validate_config_bindings(&config) {
+        Ok(()) => checks.push(DoctorCheck {
+            status: "PASS",
+            name: "Config".to_owned(),
+            detail: format!(
+                "{} server(s), {} principal(s) validated",
+                config.servers.len(),
+                config.principals.len()
+            ),
+        }),
+        Err(msg) => {
+            failures += 1;
+            checks.push(DoctorCheck {
+                status: "FAIL",
+                name: "Config".to_owned(),
+                detail: msg,
+            });
+        }
+    }
+
+    match GatewayEngine::from_config_file(config_path) {
+        Ok(engine) => {
+            let digest = engine.policy_digest();
+            let short_digest = &digest[..12.min(digest.len())];
+            checks.push(DoctorCheck {
+                status: "PASS",
+                name: "Cedar Policies".to_owned(),
+                detail: format!(
+                    "{} policy file(s) validated (digest: {short_digest})",
+                    config.policy_files.len()
+                ),
+            });
+        }
+        Err(e) => {
+            failures += 1;
+            checks.push(DoctorCheck {
+                status: "FAIL",
+                name: "Cedar Policies".to_owned(),
+                detail: e.to_string(),
+            });
+        }
+    }
+
+    let secret_refs = collect_secret_refs(&config);
+    if secret_refs.is_empty() {
+        checks.push(DoctorCheck {
+            status: "PASS",
+            name: "Secrets".to_owned(),
+            detail: "0 secret:// references configured".to_owned(),
+        });
+    } else {
+        for (source, reference) in secret_refs {
+            match check_secret_ref(&reference) {
+                Ok(()) => checks.push(DoctorCheck {
+                    status: "PASS",
+                    name: format!("Secret ({source})"),
+                    detail: format!("{reference} resolved"),
+                }),
+                Err(msg) => {
+                    failures += 1;
+                    checks.push(DoctorCheck {
+                        status: "FAIL",
+                        name: format!("Secret ({source})"),
+                        detail: msg,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut stdio_count = 0usize;
+    for server in &config.servers {
+        if let UpstreamTransport::Stdio { command, .. } = &server.transport {
+            stdio_count += 1;
+            if command_exists(command) {
+                checks.push(DoctorCheck {
+                    status: "PASS",
+                    name: format!("Stdio ({})", server.alias),
+                    detail: format!("command '{command}' found"),
+                });
+            } else {
+                failures += 1;
+                checks.push(DoctorCheck {
+                    status: "FAIL",
+                    name: format!("Stdio ({})", server.alias),
+                    detail: format!("command '{command}' not found"),
+                });
+            }
+        }
+    }
+    if stdio_count == 0 {
+        checks.push(DoctorCheck {
+            status: "SKIP",
+            name: "Stdio Commands".to_owned(),
+            detail: "no stdio servers configured".to_owned(),
+        });
+    }
+
+    let base_dir = match config_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tape_path = if config.tape_path.is_absolute() {
+        config.tape_path.clone()
+    } else {
+        base_dir.join(&config.tape_path)
+    };
+    if tape_path.exists() {
+        match GatewayEngine::verify_tape(&tape_path) {
+            Ok(verification) => {
+                let short_head = &verification.head_hash[..16.min(verification.head_hash.len())];
+                checks.push(DoctorCheck {
+                    status: "PASS",
+                    name: "Tape Integrity".to_owned(),
+                    detail: format!(
+                        "{} receipt(s) verified (head: {short_head})",
+                        verification.count
+                    ),
+                });
+            }
+            Err(e) => {
+                failures += 1;
+                checks.push(DoctorCheck {
+                    status: "FAIL",
+                    name: "Tape Integrity".to_owned(),
+                    detail: e.to_string(),
+                });
+            }
+        }
+    } else {
+        checks.push(DoctorCheck {
+            status: "SKIP",
+            name: "Tape Integrity".to_owned(),
+            detail: format!("'{}' does not exist yet", tape_path.display()),
+        });
+    }
+
+    print_doctor_summary(&checks);
+
+    if failures > 0 {
+        Err(format!("doctor found {failures} failing check(s)").into())
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
+
+fn validate_config_bindings(config: &GatewayConfig) -> Result<(), String> {
+    let mut seen_aliases: HashSet<&str> = HashSet::new();
+    for server in &config.servers {
+        validate_server_alias(&server.alias).map_err(|e| e.to_string())?;
+        if !seen_aliases.insert(server.alias.as_str()) {
+            return Err(format!("duplicate server alias '{}'", server.alias));
+        }
+    }
+
+    let mut seen_principals: HashSet<(&str, &str)> = HashSet::new();
+    for principal in &config.principals {
+        if principal.org_id.trim().is_empty() || principal.agent_id.trim().is_empty() {
+            return Err(format!(
+                "principal '{}/{}' must have non-empty org_id and agent_id",
+                principal.org_id, principal.agent_id
+            ));
+        }
+        if !seen_principals.insert((principal.org_id.as_str(), principal.agent_id.as_str())) {
+            return Err(format!(
+                "duplicate principal binding '{}/{}'",
+                principal.org_id, principal.agent_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_secret_refs(config: &GatewayConfig) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    for server in &config.servers {
+        match &server.transport {
+            UpstreamTransport::Stdio { env, .. } => {
+                for (key, value) in env {
+                    if value.starts_with("secret://") {
+                        refs.push((format!("server:{}.env.{key}", server.alias), value.clone()));
+                    }
+                }
+            }
+            UpstreamTransport::StreamableHttp { headers, .. } => {
+                for (key, value) in headers {
+                    if value.starts_with("secret://") {
+                        refs.push((
+                            format!("server:{}.header.{key}", server.alias),
+                            value.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for principal in &config.principals {
+        if let Some(token_ref) = &principal.token_ref
+            && token_ref.starts_with("secret://")
+        {
+            refs.push((
+                format!(
+                    "principal:{}/{}.token_ref",
+                    principal.org_id, principal.agent_id
+                ),
+                token_ref.clone(),
+            ));
+        }
+    }
+    refs
+}
+
+fn check_secret_ref(reference: &str) -> Result<(), String> {
+    if let Some(var_name) = reference.strip_prefix("secret://env/") {
+        if var_name.is_empty() {
+            return Err("empty environment variable name in secret://env/".to_owned());
+        }
+        std::env::var(var_name)
+            .map(|_| ())
+            .map_err(|_| format!("environment variable '{var_name}' is not set"))
+    } else if let Some(file_path) = reference.strip_prefix("secret://file/") {
+        if file_path.is_empty() {
+            return Err("empty file path in secret://file/".to_owned());
+        }
+        fs::read_to_string(file_path)
+            .map(|_| ())
+            .map_err(|e| format!("failed to read secret file '{file_path}': {e}"))
+    } else if reference.starts_with("secret://gcp/") {
+        Err("GCP Secret Manager provider is a Milestone 2+ plugin seam; use secret://env/ or secret://file/ in Milestone 1".to_owned())
+    } else if reference.starts_with("secret://") {
+        Err(format!("unsupported secret scheme in '{reference}'"))
+    } else {
+        Ok(())
+    }
+}
+
+fn command_exists(cmd: &str) -> bool {
+    if cmd.is_empty() {
+        return false;
+    }
+    if cmd.contains('/') || cmd.contains('\\') {
+        return Path::new(cmd).exists();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).exists()))
+}
+
+fn print_doctor_summary(checks: &[DoctorCheck]) {
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+
+    println!("Keelway Doctor (offline pre-flight diagnostics)");
+    println!("------------------------------------------------------------------------");
+    for c in checks {
+        match c.status {
+            "PASS" => passed += 1,
+            "FAIL" => failed += 1,
+            _ => skipped += 1,
+        }
+        println!("[{:<4}] {:<24} | {}", c.status, c.name, c.detail);
+    }
+    println!("------------------------------------------------------------------------");
+    println!("Doctor summary: {passed} passed, {failed} failed, {skipped} skipped");
 }
 
 fn scaffold_starter(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -653,6 +973,140 @@ mod tests {
             "--dry-run".as_ref(),
         ]))?;
         assert_eq!(run(replay_cli).await?, ExitCode::SUCCESS);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_doctor_validates_initialized_workspace() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = TempDirGuard::new("doctor")?;
+        let dir = tmp.path();
+        let config = dir.join("keelway.yaml");
+
+        // 1. Initialized starter workspace passes doctor (tape does not exist yet -> SKIP).
+        let init_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "init".as_ref(),
+            "--dir".as_ref(),
+            dir.as_os_str(),
+        ]))?;
+        assert_eq!(run(init_cli).await?, ExitCode::SUCCESS);
+
+        let doctor_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            config.as_os_str(),
+        ]))?;
+        assert_eq!(run(doctor_cli).await?, ExitCode::SUCCESS);
+
+        // 2. Passing secret://file/ and stdio command checks (with existing empty tape).
+        let simple_cedar = dir.join("policies/simple.cedar");
+        fs::write(
+            &simple_cedar,
+            "permit(principal in Role::\"developer\", action == Action::\"list_tool\", resource);\n",
+        )?;
+        let secret_file = dir.join("api.secret");
+        fs::write(&secret_file, "super-secret-value-not-printed\n")?;
+        let stdio_bin = dir.join("mock-mcp-bin");
+        fs::write(&stdio_bin, "#!/bin/sh\nexit 0\n")?;
+        let tape = dir.join("keelway-tape.jsonl");
+        fs::write(&tape, "")?;
+
+        let pass_cfg = dir.join("pass.yaml");
+        fs::write(
+            &pass_cfg,
+            format!(
+                r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/simple.cedar"
+principals:
+  - org_id: "acme"
+    agent_id: "coding-agent"
+    roles: ["developer"]
+    token_ref: "secret://file/{secret}"
+servers:
+  - alias: "local-fs"
+    transport:
+      type: "stdio"
+      command: "{bin}"
+      args: []
+      env:
+        API_KEY: "secret://file/{secret}"
+  - alias: "remote-http"
+    transport:
+      type: "streamable_http"
+      url: "http://127.0.0.1:9001/mcp"
+      headers:
+        Authorization: "secret://file/{secret}"
+"#,
+                secret = secret_file.display(),
+                bin = stdio_bin.display(),
+            ),
+        )?;
+
+        let pass_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            pass_cfg.as_os_str(),
+        ]))?;
+        assert_eq!(run(pass_cli).await?, ExitCode::SUCCESS);
+
+        // 3. Failing secret check returns Err.
+        let fail_secret_cfg = dir.join("fail-secret.yaml");
+        fs::write(
+            &fail_secret_cfg,
+            r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/simple.cedar"
+principals:
+  - org_id: "acme"
+    agent_id: "coding-agent"
+    roles: ["developer"]
+    token_ref: "secret://env/KEELWAY_DOCTOR_DEFINITELY_MISSING_SECRET_XYZ"
+servers: []
+"#,
+        )?;
+        let fail_secret_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            fail_secret_cfg.as_os_str(),
+        ]))?;
+        assert!(run(fail_secret_cli).await.is_err());
+
+        // 4. Failing stdio command check returns Err.
+        let fail_stdio_cfg = dir.join("fail-stdio.yaml");
+        fs::write(
+            &fail_stdio_cfg,
+            r#"bind_addr: "127.0.0.1:8080"
+tape_path: "keelway-tape.jsonl"
+policy_files:
+  - "policies/simple.cedar"
+principals:
+  - org_id: "acme"
+    agent_id: "coding-agent"
+    roles: ["developer"]
+servers:
+  - alias: "broken-stdio"
+    transport:
+      type: "stdio"
+      command: "/nonexistent/keelway-missing-binary-xyz"
+      args: []
+      env: {}
+"#,
+        )?;
+        let fail_stdio_cli = Cli::try_parse_from(os_args(&[
+            "keelway".as_ref(),
+            "doctor".as_ref(),
+            "--config".as_ref(),
+            fail_stdio_cfg.as_os_str(),
+        ]))?;
+        assert!(run(fail_stdio_cli).await.is_err());
 
         Ok(())
     }

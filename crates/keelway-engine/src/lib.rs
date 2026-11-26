@@ -4,6 +4,7 @@ pub(crate) mod mcp;
 pub(crate) mod metrics;
 pub(crate) mod p10;
 pub(crate) mod policy;
+pub mod provenance;
 pub(crate) mod secrets;
 pub(crate) mod tape;
 
@@ -199,6 +200,29 @@ impl GatewayEngine {
         tape::verify_tape(tape_path)
     }
 
+    /// Verifies a tape's SHA-256 hash chain and Ed25519 signatures.
+    pub fn verify_tape_with_key(
+        tape_path: &Path,
+        verifying_key_hex: Option<&str>,
+    ) -> Result<TapeVerification, KeelwayError> {
+        tape::verify_tape_with_key(tape_path, verifying_key_hex)
+    }
+
+    fn open_tape_for_config(
+        &self,
+        tape_path: PathBuf,
+        secrets: &dyn SecretProvider,
+    ) -> Result<TapeWriter, KeelwayError> {
+        let signer = match self.config.signing_key_ref.as_deref() {
+            Some(key_ref) => {
+                let seed = secrets.resolve(key_ref)?;
+                Some(provenance::TapeSigner::from_seed_str(&seed)?)
+            }
+            None => None,
+        };
+        TapeWriter::open_with_signer(tape_path, signer)
+    }
+
     /// Streams verified receipts from a tape in O(1) memory.
     pub fn inspect_tape<F>(tape_path: &Path, visitor: F) -> Result<TapeVerification, KeelwayError>
     where
@@ -210,7 +234,7 @@ impl GatewayEngine {
     /// Starts the Streamable HTTP (`/mcp`) gateway server.
     pub async fn serve_http(&self) -> Result<(), KeelwayError> {
         let tape_path = self.resolve_tape_path();
-        let tape = TapeWriter::open(tape_path)?;
+        let tape = self.open_tape_for_config(tape_path, &DefaultSecretProvider)?;
         let runtime = Arc::new(GatewayRuntime::build(
             &self.config,
             self.policy.clone(),
@@ -236,7 +260,7 @@ impl GatewayEngine {
         tape_path: PathBuf,
         secrets: &dyn SecretProvider,
     ) -> Result<axum::Router, KeelwayError> {
-        let tape = TapeWriter::open(tape_path)?;
+        let tape = self.open_tape_for_config(tape_path, secrets)?;
         let runtime = Arc::new(GatewayRuntime::build(
             &self.config,
             self.policy.clone(),
@@ -251,7 +275,7 @@ impl GatewayEngine {
     pub async fn serve_stdio(&self, principal_id: &str) -> Result<(), KeelwayError> {
         let principal = self.resolve_principal_id(principal_id)?;
         let tape_path = self.resolve_tape_path();
-        let tape = TapeWriter::open(tape_path)?;
+        let tape = self.open_tape_for_config(tape_path, &DefaultSecretProvider)?;
         let runtime = Arc::new(GatewayRuntime::build(
             &self.config,
             self.policy.clone(),

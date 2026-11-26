@@ -1,4 +1,5 @@
 pub use keelway_engine::core;
+pub use keelway_engine::provenance;
 
 mod policy {
     use crate::core::{KeelwayError, PolicyDecision, Principal, ToolCall};

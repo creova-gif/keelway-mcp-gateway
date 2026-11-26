@@ -7,6 +7,7 @@ use crate::core::{
 use crate::metrics::{EventOutcome, GatewayMetrics, LiveConsoleEvent};
 use crate::p10::P10GateManager;
 use crate::policy::PolicyEngine;
+use crate::provenance::extract_or_generate_trace_id;
 use crate::secrets::{SecretProvider, SecretScrubber};
 use crate::tape::TapeWriter;
 use axum::extract::State;
@@ -160,6 +161,7 @@ impl UpstreamDriver {
         arguments: &Value,
         scrubber: &Arc<SecretScrubber>,
         max_response_bytes: usize,
+        trace_id: Option<&str>,
     ) -> Result<Value, KeelwayError> {
         let req_id = uuid::Uuid::new_v4().to_string();
         let rpc_body = json!({
@@ -252,6 +254,10 @@ impl UpstreamDriver {
                 client,
             } => {
                 let mut req = client.post(url).json(&rpc_body);
+                if let Some(tid) = trace_id {
+                    let span_id = &uuid::Uuid::new_v4().simple().to_string()[..16];
+                    req = req.header("traceparent", format!("00-{tid}-{span_id}-01"));
+                }
                 for (k, v) in resolved_headers {
                     req = req.header(k, v);
                 }
@@ -454,6 +460,18 @@ impl GatewayRuntime {
 
     /// Processes a single MCP JSON-RPC 2.0 request for an authenticated `principal`.
     pub async fn handle_rpc_request(&self, principal: &Principal, req: Value) -> Value {
+        self.handle_rpc_request_with_trace(principal, req, None)
+            .await
+    }
+
+    /// Processes a single MCP JSON-RPC 2.0 request with optional W3C `trace_id` provenance correlation.
+    pub async fn handle_rpc_request_with_trace(
+        &self,
+        principal: &Principal,
+        req: Value,
+        trace_id: Option<&str>,
+    ) -> Value {
+        let base_provenance = trace_id.map(|tid| json!({ "trace_id": tid }));
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
 
@@ -700,7 +718,7 @@ impl GatewayRuntime {
                     policy_digest: scrubbed_explanation.policy_digest.clone(),
                     state,
                     outcome: None,
-                    provenance: None,
+                    provenance: base_provenance.clone(),
                 };
 
                 // Fail-closed: receipt MUST persist before dispatching any upstream side effect
@@ -927,6 +945,7 @@ impl GatewayRuntime {
                         &arguments,
                         &self.scrubber,
                         self.max_response_bytes,
+                        trace_id,
                     )
                     .await
                 {
@@ -1292,7 +1311,11 @@ async fn http_mcp_handler(
             .into_response();
     };
 
-    let resp = runtime.handle_rpc_request(&principal, body).await;
+    let trace_id =
+        extract_or_generate_trace_id(headers.get("traceparent").and_then(|v| v.to_str().ok()));
+    let resp = runtime
+        .handle_rpc_request_with_trace(&principal, body, Some(&trace_id))
+        .await;
     (StatusCode::OK, Json(resp)).into_response()
 }
 

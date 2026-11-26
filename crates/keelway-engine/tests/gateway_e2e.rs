@@ -1284,3 +1284,126 @@ permit(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn ed25519_signed_tape_and_traceparent_provenance_work_end_to_end() -> Result<(), KeelwayError>
+{
+    use keelway_engine::provenance::TapeSigner;
+
+    let tmp = tempfile::tempdir()?;
+    let tape_path = tmp.path().join("signed-e2e-tape.jsonl");
+    let seed_hex = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+    let signer = TapeSigner::from_seed_str(seed_hex)?;
+    let vk_hex = signer.verifying_key_hex();
+
+    let seen_traceparent = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let seen_clone = Arc::clone(&seen_traceparent);
+    let upstream = Router::new().route(
+        "/mcp",
+        post(
+            move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                let seen = Arc::clone(&seen_clone);
+                async move {
+                    let tp = headers
+                        .get("traceparent")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *seen.lock().await = tp;
+                    let id = body.get("id").cloned().unwrap_or(Value::Null);
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "content": [{ "type": "text", "text": "signed-ok" }] }
+                    }))
+                }
+            },
+        ),
+    );
+    let up_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let up_addr = up_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(up_listener, upstream).await;
+    });
+
+    let cfg = GatewayConfig {
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "signed-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-signed".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "echo".to_owned(),
+            transport: UpstreamTransport::StreamableHttp {
+                url: format!("http://{up_addr}/mcp"),
+                headers: BTreeMap::new(),
+            },
+            timeout_ms: 5_000,
+            tools: vec!["ping".to_owned()],
+        }],
+        signing_key_ref: Some("secret://signing_seed".to_owned()),
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"echo/ping"
+);
+"#;
+    let mut secrets = HashMap::new();
+    secrets.insert("secret://signing_seed".to_owned(), seed_hex.to_owned());
+
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path.clone(), &MapSecrets(secrets))?;
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let resp: Value = reqwest::Client::new()
+        .post(format!("http://{gw_addr}/mcp"))
+        .header("authorization", "Bearer tok-signed")
+        .header("traceparent", format!("00-{trace_id}-00f067aa0ba902b7-01"))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "echo__ping", "arguments": {} }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(resp["result"]["content"][0]["text"], "signed-ok");
+
+    let forwarded_tp = seen_traceparent.lock().await.clone().unwrap_or_default();
+    assert!(
+        forwarded_tp.starts_with(&format!("00-{trace_id}-")),
+        "expected forwarded traceparent with trace_id {trace_id}, got {forwarded_tp}"
+    );
+
+    let verified = GatewayEngine::verify_tape_with_key(&tape_path, Some(&vk_hex))?;
+    assert_eq!(verified.count, 1);
+    let mut recorded_trace_id = None;
+    GatewayEngine::inspect_tape(&tape_path, |r| {
+        recorded_trace_id = r
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("trace_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(())
+    })?;
+    assert_eq!(recorded_trace_id.as_deref(), Some(trace_id));
+
+    let wrong_vk = "aa".repeat(32);
+    assert!(GatewayEngine::verify_tape_with_key(&tape_path, Some(&wrong_vk)).is_err());
+
+    Ok(())
+}
