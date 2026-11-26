@@ -2265,3 +2265,134 @@ permit(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn streamable_http_sse_upstream_response_is_parsed_and_scrubbed() -> Result<(), KeelwayError>
+{
+    let secret_value = "sk-sse-super-secret-value";
+    let seen_accept = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let seen_version = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let seen_accept_ref = seen_accept.clone();
+    let seen_version_ref = seen_version.clone();
+
+    let upstream = Router::new().route(
+        "/mcp",
+        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let seen_accept_ref = seen_accept_ref.clone();
+            let seen_version_ref = seen_version_ref.clone();
+            async move {
+                *seen_accept_ref.lock().await = headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                *seen_version_ref.lock().await = headers
+                    .get("mcp-protocol-version")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+
+                let id = body.get("id").cloned().unwrap_or(Value::Null);
+                let payload = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{ "type": "text", "text": format!("ok leaked={secret_value}") }]
+                    }
+                });
+                let sse_body = format!(
+                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":50}}}}\n\nevent: message\ndata: {payload}\n\ndata: [DONE]\n\n"
+                );
+                axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    sse_body,
+                ))
+            }
+        }),
+    );
+    let up_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let up_addr = up_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(up_listener, upstream).await;
+    });
+
+    let dir = tempdir()?;
+    let tape_path = dir.path().join("sse-e2e-tape.jsonl");
+    let cfg = GatewayConfig {
+        tape_path: tape_path.clone(),
+        principals: vec![PrincipalConfig {
+            org_id: "acme".to_owned(),
+            agent_id: "coding-agent".to_owned(),
+            roles: vec!["developer".to_owned()],
+            token_ref: Some("tok-sse".to_owned()),
+        }],
+        servers: vec![ServerConfig {
+            alias: "sse".to_owned(),
+            timeout_ms: 5_000,
+            tools: vec!["ping".to_owned()],
+            resources: vec![],
+            prompts: vec![],
+            transport: UpstreamTransport::StreamableHttp {
+                url: format!("http://{up_addr}/mcp"),
+                headers: BTreeMap::from([(
+                    "x-api-key".to_owned(),
+                    "secret://upstream_api_key".to_owned(),
+                )]),
+            },
+        }],
+        ..Default::default()
+    };
+
+    let cedar = r#"
+permit(
+    principal in Role::"developer",
+    action == Action::"call_tool",
+    resource == Tool::"sse/ping"
+);
+"#;
+
+    let secrets = MapSecrets(HashMap::from([(
+        "secret://upstream_api_key".to_owned(),
+        secret_value.to_owned(),
+    )]));
+    let engine = GatewayEngine::from_in_memory(cfg, cedar)?;
+    let router = engine.build_test_http_router(tape_path, &secrets)?;
+    let gw_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let gw_addr = gw_listener.local_addr()?;
+    tokio::spawn(async move {
+        let _ = axum::serve(gw_listener, router).await;
+    });
+
+    let client = reqwest::Client::new();
+    let resp: Value = client
+        .post(format!("http://{gw_addr}/mcp"))
+        .header("authorization", "Bearer tok-sse")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": { "name": "sse__ping", "arguments": {} }
+        }))
+        .send()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+
+    assert_eq!(
+        seen_accept.lock().await.as_deref(),
+        Some("application/json, text/event-stream")
+    );
+    assert_eq!(seen_version.lock().await.as_deref(), Some("2025-03-26"));
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("leaked=[REDACTED]"),
+        "expected scrubbed secret in SSE payload, got: {text}"
+    );
+    assert!(
+        !text.contains(secret_value),
+        "raw secret leaked in SSE response: {text}"
+    );
+
+    Ok(())
+}

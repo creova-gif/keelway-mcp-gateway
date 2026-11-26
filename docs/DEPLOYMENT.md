@@ -57,6 +57,40 @@ docker compose -f deploy/compose.yaml up -d --build
 - Gateway HTTP endpoint: `http://localhost:8080/mcp`
 - Prometheus UI: `http://localhost:9090`
 
+## Prometheus Alerting (`deploy/alerts.yml`)
+
+Reference Prometheus alerting rules are provided in [deploy/alerts.yml](file:///Users/justinmafie/Documents/antigravity/keelway-mcp-gateway/deploy/alerts.yml) under the `keelway_gateway` rule group:
+
+- **`KeelwayUpstreamCircuitOpen`**: Fires when `keelway_circuits_open > 0` for `1m` (`severity: critical`).
+- **`KeelwayUpstreamErrorsHigh`**: Fires when `rate(keelway_upstream_errors_total[5m]) > 0.1` for `2m` (`severity: warning`).
+- **`KeelwayP10QueueBacklog`**: Fires when `keelway_p10_pending > 10` for `5m` (`severity: warning`).
+- **`KeelwayPolicyDenySpike`**: Fires when `rate(keelway_calls_total{outcome="denied_policy"}[5m]) > 1` for `2m` (`severity: warning`).
+
+To enable these rules in Prometheus, mount `deploy/alerts.yml` into your Prometheus container and reference it under `rule_files` in `prometheus.yml`:
+
+```yaml
+rule_files:
+  - /etc/prometheus/alerts.yml
+```
+
+## Kubernetes Deployment (`deploy/k8s/`)
+
+Hardened Kubernetes reference manifests are provided in [deploy/k8s/deployment.yaml](file:///Users/justinmafie/Documents/antigravity/keelway-mcp-gateway/deploy/k8s/deployment.yaml) and [deploy/k8s/service.yaml](file:///Users/justinmafie/Documents/antigravity/keelway-mcp-gateway/deploy/k8s/service.yaml):
+
+- **Deployment (`keelway-gateway`)**:
+  - Security context: `runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: ["ALL"]`, and `seccompProfile.type: RuntimeDefault`.
+  - Sets `KEELWAY_BIND_ADDR: "0.0.0.0:8080"` and `terminationGracePeriodSeconds: 30`.
+  - Mounts ConfigMap `keelway-config` (read-only) at `/etc/keelway`, PVC `keelway-data` at `/var/lib/keelway` for audit tapes, and a memory-backed `emptyDir` at `/tmp`.
+  - Configures `/healthz` liveness and `/readyz` readiness probes.
+- **Service (`keelway-gateway`)**:
+  - `ClusterIP` on port `8080` with `prometheus.io/scrape: "true"`, `prometheus.io/path: "/metrics"`, and `prometheus.io/port: "8080"` annotations.
+
+Create the prerequisite `keelway-config` ConfigMap and `keelway-data` PVC in your target namespace, then apply the manifests:
+
+```sh
+kubectl apply -f deploy/k8s/
+```
+
 ## Kubernetes Liveness and Readiness Probes
 
 Keelway exposes separate liveness and readiness endpoints:

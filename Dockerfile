@@ -26,14 +26,14 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system keelway \
-    && useradd --system --gid keelway --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin keelway \
-    && mkdir -p /etc/keelway \
-    && chown keelway:keelway /etc/keelway
+    && groupadd --system --gid 10001 keelway \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin keelway \
+    && mkdir -p /etc/keelway /var/lib/keelway \
+    && chown 10001:10001 /etc/keelway /var/lib/keelway
 
 COPY --from=builder /app/target/release/keelway /usr/local/bin/keelway
 
-USER keelway
+USER 10001:10001
 
 ENV KEELWAY_BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080

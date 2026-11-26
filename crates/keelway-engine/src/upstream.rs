@@ -199,7 +199,11 @@ impl UpstreamDriver {
                 timeout_ms,
                 client,
             } => {
-                let mut req = client.post(url).json(&rpc_body);
+                let mut req = client
+                    .post(url)
+                    .header("accept", "application/json, text/event-stream")
+                    .header("mcp-protocol-version", "2025-03-26")
+                    .json(&rpc_body);
                 if let Some(tid) = trace_id {
                     let span_id = &uuid::Uuid::new_v4().simple().to_string()[..16];
                     req = req.header("traceparent", format!("00-{tid}-{span_id}-01"));
@@ -229,6 +233,12 @@ impl UpstreamDriver {
                     )));
                 }
 
+                let is_sse = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+
                 // Stream body through sliding-window Aho-Corasick scrubber to catch SSE chunk-straddling secrets
                 let mut streaming_scrubber = scrubber.streaming();
                 let mut byte_stream = resp.bytes_stream();
@@ -249,9 +259,25 @@ impl UpstreamDriver {
                 }
                 assembled.push_str(&streaming_scrubber.finish());
 
-                let parsed: Value = serde_json::from_str(&assembled).unwrap_or_else(
-                    |_| json!({ "content": [{ "type": "text", "text": assembled }] }),
-                );
+                let parsed: Value = if is_sse {
+                    extract_sse_json_payload(&assembled).unwrap_or_else(
+                        || json!({ "content": [{ "type": "text", "text": assembled }] }),
+                    )
+                } else {
+                    match serde_json::from_str::<Value>(&assembled) {
+                        Ok(val) => val,
+                        Err(_)
+                            if assembled
+                                .lines()
+                                .any(|l| l.trim_start().starts_with("data:")) =>
+                        {
+                            extract_sse_json_payload(&assembled).unwrap_or_else(
+                                || json!({ "content": [{ "type": "text", "text": assembled }] }),
+                            )
+                        }
+                        Err(_) => json!({ "content": [{ "type": "text", "text": assembled }] }),
+                    }
+                };
                 if let Some(err) = parsed.get("error").filter(|v| !v.is_null()) {
                     return Err(KeelwayError::Mcp(format!("upstream JSON-RPC error: {err}")));
                 }
@@ -315,4 +341,73 @@ fn spawn_stdio_child(
         stdin,
         stdout: BufReader::new(stdout),
     })
+}
+
+fn extract_sse_json_payload(raw: &str) -> Option<Value> {
+    let mut last_valid: Option<Value> = None;
+    let mut data_lines: Vec<&str> = Vec::new();
+
+    let flush_event = |lines: &mut Vec<&str>, last: &mut Option<Value>| {
+        if lines.is_empty() {
+            return;
+        }
+        let joined = lines.join("\n");
+        lines.clear();
+        let trimmed = joined.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return;
+        }
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            *last = Some(val);
+        }
+    };
+
+    for line in raw.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            flush_event(&mut data_lines, &mut last_valid);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            data_lines.push(payload);
+        }
+    }
+    flush_event(&mut data_lines, &mut last_valid);
+
+    last_valid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_sse_json_payload_handles_multi_event_done_and_multiline_data() {
+        let multi_event = "\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50}}\n\
+\n\
+data:\n\
+\n\
+event: message\n\
+data: {\n\
+data:   \"jsonrpc\": \"2.0\",\n\
+data:   \"id\": 7,\n\
+data:   \"result\": {\"content\": [{\"type\": \"text\", \"text\": \"hello\"}]}\n\
+data: }\n\
+\n\
+data: [DONE]\n\n";
+
+        let parsed = extract_sse_json_payload(multi_event);
+        assert_eq!(parsed.as_ref().and_then(|v| v["id"].as_i64()), Some(7));
+        assert_eq!(
+            parsed
+                .as_ref()
+                .and_then(|v| v["result"]["content"][0]["text"].as_str()),
+            Some("hello")
+        );
+
+        assert!(extract_sse_json_payload("data: [DONE]\n\ndata:\n\n").is_none());
+    }
 }

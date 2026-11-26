@@ -1,0 +1,38 @@
+groups:
+  - name: keelway_gateway
+    rules:
+      - alert: KeelwayUpstreamCircuitOpen
+        expr: keelway_circuits_open > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keelway upstream circuit breaker is open"
+          description: "{{ $value }} upstream circuit(s) are currently open on {{ $labels.instance }}."
+
+      - alert: KeelwayUpstreamErrorsHigh
+        expr: rate(keelway_upstream_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High upstream error rate on Keelway gateway"
+          description: "Upstream error rate is {{ $value | printf \"%.3f\" }}/s over the last 5m on {{ $labels.instance }}."
+
+      - alert: KeelwayP10QueueBacklog
+        expr: keelway_p10_pending > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Keelway P-10 approval queue backlog"
+          description: "{{ $value }} P-10 requests are pending operator approval for more than 5m on {{ $labels.instance }}."
+
+      - alert: KeelwayPolicyDenySpike
+        expr: rate(keelway_calls_total{outcome="denied_policy"}[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spike in Cedar policy denials on Keelway gateway"
+          description: "Policy denial rate is {{ $value | printf \"%.2f\" }}/s over the last 5m on {{ $labels.instance }}."
