@@ -1050,13 +1050,25 @@ permit(
     let client = reqwest::Client::new();
     let base = format!("http://{gw_addr}");
 
-    // 1. /healthz returns 200 ok
+    // 1. /healthz returns 200 ok with uptime_seconds and security headers
     let hz = client
         .get(format!("{base}/healthz"))
         .send()
         .await
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
     assert_eq!(hz.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        hz.headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    let hz_json: Value = hz
+        .json()
+        .await
+        .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
+    assert_eq!(hz_json["status"], "ok");
+    assert!(hz_json["uptime_seconds"].is_u64());
 
     // 2. Launch a tool call that hits the P-10 gate; approve it asynchronously
     let client_call = client.clone();
@@ -1163,6 +1175,8 @@ permit(
         .map_err(|e| KeelwayError::Mcp(e.to_string()))?;
     assert!(metrics_text.contains("keelway_calls_total{outcome=\"p10_approved\"} 1"));
     assert!(metrics_text.contains("keelway_circuits_open 0"));
+    assert!(metrics_text.contains("keelway_active_upstream_inflight"));
+    assert!(metrics_text.contains("keelway_gateway_uptime_seconds"));
 
     // 4. Verify tape recorded AWAITING + SEALED receipts cleanly
     let verified = GatewayEngine::verify_tape(&tape_path)?;

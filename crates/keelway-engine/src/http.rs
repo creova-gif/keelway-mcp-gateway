@@ -2,8 +2,10 @@ use crate::circuit::CircuitState;
 use crate::core::{Decision, Explanation, KeelwayError, Principal, ReceiptState, UnsealedReceipt};
 use crate::mcp::GatewayRuntime;
 use crate::provenance::extract_or_generate_trace_id;
-use axum::extract::State;
+use axum::extract::{Request, State};
+use axum::http::header::{CACHE_CONTROL, HeaderValue, X_CONTENT_TYPE_OPTIONS};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,7 +30,20 @@ pub fn build_http_router(runtime: Arc<GatewayRuntime>) -> Router {
         .route("/events", get(events_sse_handler))
         .route("/p10/pending", get(p10_pending_handler))
         .route("/p10/resolve", post(p10_resolve_handler))
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .with_state(runtime)
+}
+
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    if !headers.contains_key(X_CONTENT_TYPE_OPTIONS) {
+        headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    }
+    if !headers.contains_key(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    resp
 }
 
 async fn ui_console_handler() -> Response {
@@ -52,8 +67,15 @@ async fn ui_console_handler() -> Response {
         .into_response()
 }
 
-async fn healthz_handler() -> Response {
-    (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
+async fn healthz_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "uptime_seconds": runtime.metrics.uptime_seconds(),
+        })),
+    )
+        .into_response()
 }
 
 async fn readyz_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response {
@@ -89,6 +111,9 @@ async fn metrics_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response
         .filter(|(_, state)| *state == CircuitState::Open)
         .count();
     runtime.metrics.set_circuits_open(open_count as u64);
+    runtime
+        .metrics
+        .set_active_inflight(runtime.budgets.active_in_flight());
     (
         StatusCode::OK,
         [(
